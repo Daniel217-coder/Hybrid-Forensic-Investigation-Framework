@@ -21,3 +21,11 @@ inputs/
 # OS
 .DS_Store
 Thumbs.db
+
+Dissertation/
+artifacts/
+cases/
+inputs/
+__pycache__/
+.venv/
+.vscode/
