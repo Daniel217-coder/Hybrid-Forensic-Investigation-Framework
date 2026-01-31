@@ -17,7 +17,6 @@ def extract_domains_from_urls(urls: List[str] | None) -> List[str]:
             p = urlparse(u.strip())
             host = (p.hostname or "").strip().lower()
             if host:
-                # strip trailing dot
                 host = host[:-1] if host.endswith(".") else host
                 out.add(host)
         except Exception:
@@ -29,9 +28,9 @@ def extract_domains_from_urls(urls: List[str] | None) -> List[str]:
 class DynNoiseRules:
     """
     Goal:
-      - Remove obvious SDK/framework class noise from 'classes' list
       - Mark well-known benign domains/emails as noise for scoring
-      - Still keep full data in iocs_split for transparency
+      - Remove obvious SDK/framework/class-token noise that looks like domains
+      - Still keep full raw IOC list in artifact for transparency
     """
 
     # Class/package prefixes to ignore (SDK/framework/ads/common libs)
@@ -73,6 +72,37 @@ class DynNoiseRules:
         "ch.qos.logback.",
     ])
 
+    # IMPORTANT: "domain-like" tokens that are actually class/package names.
+    # If a "domain" starts with these, treat as benign noise for scoring.
+    domain_prefix_noise: List[str] = field(default_factory=lambda: [
+        "java.",
+        "javax.",
+        "android.",
+        "androidx.",
+        "kotlin.",
+        "kotlinx.",
+        "dalvik.",
+        "okhttp3.",
+        "okio.",
+        "retrofit2.",
+        "org.jetbrains.",
+        "org.intellij.",
+        "org.json.",
+        "org.w3c.",
+        "org.xml.",
+        "org.chromium.",
+        "org.webkit.",
+        "com.android.",
+        # common method-ish tokens that appear in your earlier reports:
+        "inetaddress.",
+        "socket.",
+        "runtime.",
+        "processbuilder.",
+        "activity.",
+        "httpurlconnection.",
+        "webview.",
+    ])
+
     # Domains we treat as benign (do NOT count in scoring)
     domain_allow_suffix: List[str] = field(default_factory=lambda: [
         "google.com",
@@ -108,6 +138,8 @@ class DynNoiseRules:
         "apple.com",
         "icloud.com",
         "amazonaws.com",
+        # instrumentation-related benign docs
+        "frida.re",
     ])
 
     # Exact domains you want to allow even if not suffix-matching
@@ -118,6 +150,7 @@ class DynNoiseRules:
         "www.tiktok.com",
         "www.example.com",
         "support.google.com",
+        "frida.re",
     })
 
     # Email allow patterns (crash reporting / placeholders / SDK)
@@ -163,21 +196,16 @@ class DynNoiseRules:
 
         lc = c.lower()
 
-        # prefix noise (strong)
         for p in self.class_prefix_noise:
             if lc.startswith(p):
                 return True
 
-        # very short tokens are mostly junk
         if len(lc) <= 2:
             return True
 
-        # internal generated / rro / build config
         if "rro" in lc or "buildconfig" in lc or "auto_generated" in lc:
             return True
 
-        # contains-noise heuristic (weak) — only if token looks like framework-ish
-        # (prevents filtering app-specific classes too aggressively)
         dot_count = lc.count(".")
         if dot_count >= 1:
             for k in self.class_contains_noise:
@@ -197,11 +225,15 @@ class DynNoiseRules:
         if not d:
             return True
 
+        # If it looks like a Java/SDK token, treat as benign noise.
+        for pfx in self.domain_prefix_noise:
+            if d.startswith(pfx):
+                return True
+
         if d in self.domain_allow_exact:
             return True
 
-        # if it doesn't look like a domain, treat as benign noise for scoring
-        # (prevents "state." etc from becoming "domains")
+        # if it doesn't look like a real domain, treat as benign
         if not _DOMAIN_RX.match(d):
             return True
 
@@ -222,10 +254,6 @@ class DynNoiseRules:
         return False
 
     def infer_benign_libs_from_classes(self, classes_total: Iterable[str]) -> List[str]:
-        """
-        Quick "what benign SDKs were observed" based on class tokens.
-        Used only for reporting/debug.
-        """
         lc = " ".join((c or "").lower() for c in classes_total or [])
         found: List[str] = []
 
@@ -247,8 +275,8 @@ class DynNoiseRules:
         add("Google Play Services", "com.google.android.gms", "play-services")
         add("Facebook SDK", "com.facebook")
         add("Compose", "compose")
+        add("Frida", "frida")
 
-        # unique, stable order
         out = []
         seen = set()
         for x in found:

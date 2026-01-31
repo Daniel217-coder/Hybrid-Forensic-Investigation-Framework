@@ -1,197 +1,129 @@
 // src/cybershadow_dyn.js
 'use strict';
 
-/**
- * CyberShadow dynamic hooks (real device robust)
- * Key changes:
- * - Do NOT rely on Java.available alone. We retry Java.perform() until success or timeout.
- * - Native hooks: avoid Module.findExportByName; use Process.getModuleByName("libdl.so") fallback.
- * - emit() uses send() primarily (console.log kept for manual debug).
- */
+const JS_VERSION = "2026-01-31-hardhooks-v2";
 
-function now() { try { return new Date().toISOString(); } catch (e) { return ""; } }
-function s(x) { try { return (x === null || x === undefined) ? ("" + x) : x.toString(); } catch (e) { return "[toString_error]"; } }
+function nowIso() { try { return new Date().toISOString(); } catch (e) { return ""; } }
+function emit(tag, msg) { try { send({ ts: nowIso(), tag: String(tag), msg: String(msg) }); } catch (e) {} }
+function j2s(x) { try { return x === null || x === undefined ? "" : String(x); } catch (e) { return ""; } }
 
-function emit(tag, msg) {
-  // Keep console for manual runs
-  try { console.log("[" + now() + "][" + tag + "] " + msg); } catch (e) {}
-  // Machine-friendly channel (used by python tool)
-  try { send({ ts: now(), tag: tag, msg: msg }); } catch (e2) {}
-}
+emit("SELFTEST", "js_version=" + JS_VERSION);
+emit("BOOT", "Script loaded.");
+try { emit("NATIVE", "proc=" + Process.name + " pid=" + Process.id); } catch (e) {}
 
-function diagBoot() {
+setInterval(function () { emit("PING", "alive"); }, 2500);
+
+Java.perform(function () {
+  emit("READY", "Java runtime ready. js_version=" + JS_VERSION);
+
+  // ACT lifecycle
   try {
-    emit("BOOT", "pid=" + Process.id + " arch=" + Process.arch + " platform=" + Process.platform + " ptr=" + Process.pointerSize);
+    const Activity = Java.use("android.app.Activity");
+
+    Activity.onCreate.overload("android.os.Bundle").implementation = function (b) {
+      try { emit("ACT", "onCreate " + this.getClass().getName()); } catch (e) {}
+      return this.onCreate(b);
+    };
+
+    Activity.onResume.implementation = function () {
+      try { emit("ACT", "onResume " + this.getClass().getName()); } catch (e) {}
+      return this.onResume();
+    };
+
+    Activity.onNewIntent.implementation = function (intent) {
+      try { emit("ACT", "onNewIntent " + this.getClass().getName()); } catch (e) {}
+      return this.onNewIntent(intent);
+    };
+
+    emit("HOOK", "Activity lifecycle hooks installed.");
   } catch (e) {
-    emit("BOOT", "Process info unavailable: " + s(e));
+    emit("HOOK", "Activity lifecycle hook failed: " + e);
   }
 
-  // ART indicator
+  // PROC
   try {
-    if (Process.enumerateModules) {
-      var mods = Process.enumerateModules();
-      var hasArt = false;
-      for (var i = 0; i < mods.length; i++) {
-        if (mods[i].name.indexOf("libart.so") !== -1) { hasArt = true; break; }
-      }
-      emit("BOOT", "libart.so loaded=" + hasArt);
-    }
-  } catch (e) {}
-}
+    const Runtime = Java.use("java.lang.Runtime");
+    const exec1 = Runtime.exec.overload("java.lang.String");
+    exec1.implementation = function (cmd) {
+      emit("PROC", "Runtime.exec " + j2s(cmd));
+      return exec1.call(this, cmd);
+    };
 
-// ----------------------------
-// Native hooks (dlopen/android_dlopen_ext) - best effort without Module.findExportByName
-// ----------------------------
+    const PB = Java.use("java.lang.ProcessBuilder");
+    const pbStart = PB.start.overload();
+    pbStart.implementation = function () {
+      let c = "";
+      try { c = this.command().toString(); } catch (e2) {}
+      emit("PROC", "ProcessBuilder.start " + c);
+      return pbStart.call(this);
+    };
 
-function _findExportFallback(moduleName, exportName) {
-  // Try Module.findExportByName if present; fallback to Process.getModuleByName(...).findExportByName(...)
+    emit("HOOK", "PROC hooks installed.");
+  } catch (e) {
+    emit("HOOK", "PROC hooks failed: " + e);
+  }
+
+  // FILE
   try {
-    if (typeof Module !== "undefined" && Module.findExportByName) {
-      return Module.findExportByName(null, exportName);
-    }
-  } catch (e) {}
+    const File = Java.use("java.io.File");
+    const del = File.delete.overload();
+    del.implementation = function () {
+      emit("FILE", "delete " + j2s(this.getAbsolutePath()));
+      return del.call(this);
+    };
 
+    const FOS = Java.use("java.io.FileOutputStream");
+    const i1 = FOS.$init.overload("java.lang.String");
+    i1.implementation = function (path) {
+      emit("FILE", "write-open " + j2s(path));
+      return i1.call(this, path);
+    };
+    emit("HOOK", "FILE hooks installed.");
+  } catch (e) {
+    emit("HOOK", "FILE hooks failed: " + e);
+  }
+
+  // DLOAD
   try {
-    if (Process.getModuleByName) {
-      var m = Process.getModuleByName(moduleName);
-      if (m && m.findExportByName) return m.findExportByName(exportName);
-    }
-  } catch (e2) {}
+    const DexCL = Java.use("dalvik.system.DexClassLoader");
+    DexCL.$init.overload("java.lang.String", "java.lang.String", "java.lang.String", "java.lang.ClassLoader")
+      .implementation = function (dexPath, optDir, libSearch, parent) {
+        emit("DLOAD", `DexClassLoader dex=${j2s(dexPath)} opt=${j2s(optDir)}`);
+        return this.$init(dexPath, optDir, libSearch, parent);
+      };
+    emit("HOOK", "DLOAD hooks installed.");
+  } catch (e) {
+    emit("HOOK", "DLOAD hooks failed: " + e);
+  }
 
-  return null;
-}
-
-function hookDlopen() {
+  // SMS query detection (light)
   try {
-    var ptrAndroid = _findExportFallback("libdl.so", "android_dlopen_ext");
-    var ptrDlopen = _findExportFallback("libdl.so", "dlopen");
-
-    if (!ptrAndroid && !ptrDlopen) {
-      emit("WARN", "dlopen exports not found; native load hooks skipped.");
-      return;
-    }
-
-    function attachFn(ptr, name) {
-      if (!ptr) return;
-      Interceptor.attach(ptr, {
-        onEnter: function (args) {
-          try {
-            var path = args[0] ? Memory.readCString(args[0]) : "";
-            emit("NATIVE", name + "(" + s(path) + ")");
-          } catch (e) {}
+    const CR = Java.use("android.content.ContentResolver");
+    const q = CR.query.overload("android.net.Uri", "[Ljava.lang.String;", "java.lang.String", "[Ljava.lang.String;", "java.lang.String");
+    q.implementation = function (uri, proj, sel, args, sort) {
+      try {
+        const u = uri ? uri.toString() : "";
+        if (u.startsWith("content://sms") || u.startsWith("content://mms-sms") || u.startsWith("content://mms")) {
+          emit("SMS", "query " + u + " sel=" + j2s(sel));
         }
-      });
-      emit("HOOK", "Native hook installed: " + name);
-    }
-
-    attachFn(ptrAndroid, "android_dlopen_ext");
-    attachFn(ptrDlopen, "dlopen");
-
+      } catch (e) {}
+      return q.call(this, uri, proj, sel, args, sort);
+    };
+    emit("HOOK", "SMS hooks installed.");
   } catch (e) {
-    emit("WARN", "Native dlopen hook failed: " + s(e));
+    emit("HOOK", "SMS hooks failed: " + e);
   }
-}
 
-// ----------------------------
-// Java hooks (installed once we manage to enter Java.perform)
-// ----------------------------
-
-function installJavaHooks() {
-  // DNS
+  // CRYPTO (context)
   try {
-    var InetAddress = Java.use('java.net.InetAddress');
-    InetAddress.getByName.implementation = function (host) {
-      emit("DNS", "getByName " + s(host));
-      return this.getByName(host);
+    const Cipher = Java.use("javax.crypto.Cipher");
+    const gi = Cipher.getInstance.overload("java.lang.String");
+    gi.implementation = function (x) {
+      emit("CRYPTO", "Cipher.getInstance " + j2s(x));
+      return gi.call(this, x);
     };
-    emit("HOOK", "InetAddress.getByName hooked");
+    emit("HOOK", "CRYPTO hooks installed.");
   } catch (e) {
-    emit("HOOK", "InetAddress hook failed: " + s(e));
+    emit("HOOK", "CRYPTO hooks failed: " + e);
   }
-
-  // Socket.connect (IP:port)
-  try {
-    var Socket = Java.use('java.net.Socket');
-    Socket.connect.overload('java.net.SocketAddress', 'int').implementation = function (addr, timeout) {
-      emit("SOCKET", "connect " + s(addr) + " timeout=" + timeout);
-      return this.connect(addr, timeout);
-    };
-    emit("HOOK", "Socket.connect hooked");
-  } catch (e) {}
-
-  // WebView URLs
-  try {
-    var WebView = Java.use('android.webkit.WebView');
-    WebView.loadUrl.overload('java.lang.String').implementation = function (url) {
-      emit("WEBVIEW", "loadUrl " + s(url));
-      return this.loadUrl(url);
-    };
-    emit("HOOK", "WebView.loadUrl hooked");
-  } catch (e) {}
-
-  // Runtime.exec
-  try {
-    var Runtime = Java.use('java.lang.Runtime');
-    Runtime.exec.overload('java.lang.String').implementation = function (cmd) {
-      emit("PROC", "Runtime.exec " + s(cmd));
-      return this.exec(cmd);
-    };
-    emit("HOOK", "Runtime.exec hooked");
-  } catch (e) {
-    emit("HOOK", "Runtime.exec hook failed: " + s(e));
-  }
-
-  emit("READY", "Java hooks loaded. Interact with the app now.");
-}
-
-// ----------------------------
-// Java.perform retry loop (do not trust Java.available)
-// ----------------------------
-
-function tryInstallJavaHooksWithRetry(maxMs, intervalMs) {
-  var start = Date.now();
-  var installed = false;
-
-  function tick() {
-    if (installed) return;
-
-    // periodic status
-    try {
-      if (((Date.now() - start) % 5000) < intervalMs) {
-        emit("BOOT", "trying Java.perform... elapsedMs=" + (Date.now() - start) + " Java.available=" + (typeof Java !== "undefined" ? Java.available : "noJavaObj"));
-      }
-    } catch (e0) {}
-
-    try {
-      // Even if Java.available is false, this may start working later.
-      Java.perform(function () {
-        if (installed) return;
-        installed = true;
-        installJavaHooks();
-      });
-      return; // success path
-    } catch (e) {
-      // keep retrying
-    }
-
-    if ((Date.now() - start) >= maxMs) {
-      emit("ERR", "Java.perform never became available within timeout; running native-only.");
-      return;
-    }
-    setTimeout(tick, intervalMs);
-  }
-
-  tick();
-}
-
-// ----------------------------
-// Entry point
-// ----------------------------
-
-setImmediate(function () {
-  emit("BOOT", "Script loaded.");
-  diagBoot();
-  hookDlopen();
-  // try for 90s, polling 250ms
-  tryInstallJavaHooksWithRetry(90000, 250);
 });

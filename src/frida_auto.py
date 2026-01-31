@@ -4,458 +4,883 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
-
-# Optional project hooks (safe fallback)
-try:
-    from src.case_report import write_case_html  # type: ignore
-except Exception:
-    write_case_html = None
+from typing import Optional, List, Dict, Tuple, Any
 
 try:
-    from src.report_html import write_apk_dynamic_html  # type: ignore
+    import frida  # type: ignore
 except Exception:
-    write_apk_dynamic_html = None
+    frida = None  # type: ignore
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
-
-def _utc_now_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-def _utc_compact() -> str:
+def utc_now_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
-def _safe_mkdir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+def utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def _run(cmd: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
-    )
+def ensure_parent(p: Path) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
 
 
-def _which(exe: str) -> Optional[str]:
-    return shutil.which(exe)
+def save_json(p: Path, obj: dict) -> None:
+    ensure_parent(p)
+    p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def _find_adb() -> str:
-    r"""
-    Finds adb in this order:
-    1) env ADB_PATH (explicit)
-    2) adb in PATH
-    3) %LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe
-    """
-    env_adb = os.environ.get("ADB_PATH", "").strip().strip('"')
-    if env_adb and Path(env_adb).exists():
-        return env_adb
-
-    adb_in_path = _which("adb") or _which("adb.exe")
-    if adb_in_path:
-        return adb_in_path
-
-    localapp = os.environ.get("LOCALAPPDATA", "")
-    candidate = Path(localapp) / "Android" / "Sdk" / "platform-tools" / "adb.exe"
-    if candidate.exists():
-        return str(candidate)
-
-    raise FileNotFoundError(
-        "ADB not found. Set ADB_PATH or install Android platform-tools.\n"
-        "PowerShell quick-fix:\n"
-        '$env:ADB_PATH="$env:LOCALAPPDATA\\Android\\Sdk\\platform-tools\\adb.exe"\n'
-        '$env:Path += ";$env:LOCALAPPDATA\\Android\\Sdk\\platform-tools"\n'
-    )
-
-
-def _find_frida_cli() -> str:
-    frida = _which("frida") or _which("frida.exe")
-    if frida:
-        return frida
-    raise FileNotFoundError("frida CLI not found. Install: pip install frida-tools")
-
-
-def _find_frida_ps() -> str:
-    fridaps = _which("frida-ps") or _which("frida-ps.exe")
-    if fridaps:
-        return fridaps
-    raise FileNotFoundError("frida-ps not found. Install: pip install frida-tools")
-
-
-def _ensure_case_structure(case_dir: Path) -> Path:
-    _safe_mkdir(case_dir)
-    _safe_mkdir(case_dir / "artifacts")
-    _safe_mkdir(case_dir / "reports")
-
-    case_json = case_dir / "case.json"
-    if not case_json.exists():
-        minimal = {
-            "case_id": case_dir.name,
-            "created_utc": _utc_now_str(),
-            "notes": "Auto-created by frida_auto.py (minimal case.json).",
-            "evidence": [],
-        }
-        case_json.write_text(json.dumps(minimal, indent=2), encoding="utf-8")
-    return case_json
+def which_or_guess_adb() -> str:
+    adb = shutil.which("adb")
+    if adb:
+        return adb
+    local = os.environ.get("LOCALAPPDATA", "")
+    guess = Path(local) / "Android" / "Sdk" / "platform-tools" / "adb.exe"
+    if guess.exists():
+        return str(guess)
+    raise SystemExit("[ERROR] adb not found. Add platform-tools to PATH.")
 
 
 @dataclass
+class DeviceInfo:
+    serial: str
+    release: str
+    sdk: str
+    abi: str
+
+
 class Adb:
-    adb_path: str
-    serial: Optional[str] = None
+    def __init__(self, adb_path: str, serial: str, retries: int = 8, retry_sleep: float = 0.8):
+        self.adb = adb_path
+        self.serial = serial
+        self.retries = max(0, int(retries))
+        self.retry_sleep = max(0.2, float(retry_sleep))
 
-    def _base(self) -> List[str]:
-        base = [self.adb_path]
-        if self.serial:
-            base += ["-s", self.serial]
-        return base
+    def base(self) -> List[str]:
+        return [self.adb, "-s", self.serial]
 
-    def devices(self) -> str:
-        cp = _run(self._base() + ["devices"], timeout=20)
-        return (cp.stdout or "") + (cp.stderr or "")
-
-    def shell(self, cmd: str, timeout: int = 30) -> subprocess.CompletedProcess:
-        return _run(self._base() + ["shell", cmd], timeout=timeout)
-
-    def install(self, apk: Path, timeout: int = 180) -> subprocess.CompletedProcess:
-        return _run(self._base() + ["install", "-r", str(apk)], timeout=timeout)
-
-    def uninstall(self, package: str, timeout: int = 120) -> subprocess.CompletedProcess:
-        return _run(self._base() + ["uninstall", package], timeout=timeout)
-
-    def force_stop(self, package: str) -> subprocess.CompletedProcess:
-        return self.shell(f"am force-stop {package}", timeout=30)
-
-    def launch(self, package: str) -> subprocess.CompletedProcess:
-        return self.shell(f"monkey -p {package} -c android.intent.category.LAUNCHER 1", timeout=60)
-
-    def pidof(self, package: str) -> Optional[int]:
-        cp = self.shell(f"pidof {package}", timeout=15)
-        out = (cp.stdout or "").strip()
-        if cp.returncode == 0 and out:
+    def _run(self, args: List[str], timeout: int = 25) -> str:
+        last = ""
+        for _ in range(self.retries + 1):
             try:
-                return int(out.split()[0])
-            except Exception:
-                return None
+                cp = subprocess.run(
+                    self.base() + args,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=timeout,
+                )
+                out = (cp.stdout or "").strip()
+                last = out
+                low = out.lower()
+                if "device offline" in low or "device not found" in low or "no devices" in low:
+                    time.sleep(self.retry_sleep)
+                    continue
+                return out
+            except subprocess.TimeoutExpired:
+                last = "TIMEOUT"
+                time.sleep(self.retry_sleep)
+            except Exception as e:
+                last = f"ERROR: {e}"
+                time.sleep(self.retry_sleep)
+        return last
+
+    def shell(self, cmd: str, timeout: int = 25) -> str:
+        return self._run(["shell", cmd], timeout=timeout)
+
+    def logcat_clear(self) -> None:
+        self._run(["logcat", "-c"], timeout=20)
+
+    def logcat_proc(self) -> subprocess.Popen:
+        return subprocess.Popen(
+            self.base() + ["logcat", "-v", "threadtime"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+        )
+
+    def forward_remove(self, port: int) -> None:
+        self._run(["forward", "--remove", f"tcp:{port}"], timeout=10)
+
+    def forward(self, host_port: int, device_port: int) -> None:
+        self._run(["forward", f"tcp:{host_port}", f"tcp:{device_port}"], timeout=10)
+
+    def resolve_main_activity(self, pkg: str) -> Optional[str]:
+        out = self.shell(f"cmd package resolve-activity --brief {pkg} 2>/dev/null || true", timeout=25)
+        for line in out.splitlines():
+            line = line.strip()
+            if "/" in line and line.startswith(pkg + "/"):
+                return line
         return None
 
+    def resolve_view_activity(self, pkg: str, url: str) -> Optional[str]:
+        u = (url or "").replace("'", "%27")
+        out = self.shell(
+            f"cmd package resolve-activity --brief -a android.intent.action.VIEW -d '{u}' -p {pkg} 2>/dev/null || true",
+            timeout=25,
+        )
+        for line in out.splitlines():
+            line = line.strip()
+            if "/" in line and line.startswith(pkg + "/"):
+                return line
+        return None
 
-def _pick_device_serial(adb: Adb) -> Optional[str]:
-    out = adb.devices()
-    lines = out.splitlines()
-    serials = []
-    for ln in lines:
-        ln = ln.strip()
-        if not ln or ln.startswith("List of devices"):
+    def start_component(self, component: str) -> str:
+        return self.shell(f"am start -n {component}", timeout=25)
+
+    def monkey_launch(self, pkg: str) -> str:
+        return self.shell(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1", timeout=25)
+
+    def start_view_url(self, pkg: str, url: str) -> str:
+        u = (url or "").replace("'", "%27")
+        comp = self.resolve_view_activity(pkg, url)
+        if comp:
+            return self.shell(
+                f"am start -n {comp} -a android.intent.action.VIEW -d '{u}' --activity-new-task --activity-clear-top",
+                timeout=25,
+            )
+        return self.shell(
+            f"am start -a android.intent.action.VIEW -d '{u}' -p {pkg} --activity-new-task --activity-clear-top",
+            timeout=25,
+        )
+
+    def force_stop(self, pkg: str) -> None:
+        self.shell(f"am force-stop {pkg}", timeout=20)
+
+    def has_listener_27042(self) -> bool:
+        out = self.shell("cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -i 69A2 | head -n 1 || true", timeout=10).lower()
+        return ":69a2" in out
+
+    def pidof_all(self, pkg: str) -> List[int]:
+        out = self.shell(f"pidof {pkg} 2>/dev/null || true", timeout=10).strip()
+        pids: List[int] = []
+        for tok in (out.split() if out else []):
+            if tok.isdigit():
+                pids.append(int(tok))
+        return pids
+
+    def ps_processes(self) -> List[Tuple[int, str]]:
+        out = self.shell("ps -A 2>/dev/null || ps 2>/dev/null || true", timeout=20)
+        rows: List[Tuple[int, str]] = []
+        for ln in out.splitlines():
+            ln = ln.strip()
+            if not ln or ln.lower().startswith("user") or ln.lower().startswith("uid"):
+                continue
+            parts = ln.split()
+            pid = None
+            for p in parts[:8]:
+                if p.isdigit():
+                    pid = int(p)
+                    break
+            name = parts[-1] if parts else ""
+            if pid is not None and name:
+                rows.append((pid, name))
+        return rows
+
+    def all_package_pids(self, pkg: str) -> List[int]:
+        pids = set(self.pidof_all(pkg))
+        for pid, name in self.ps_processes():
+            if name == pkg or name.startswith(pkg + ":"):
+                pids.add(pid)
+        return sorted(pids)
+
+    def get_app_uid(self, pkg: str) -> Optional[int]:
+        out = self.shell(f"dumpsys package {pkg} 2>/dev/null | grep -m 1 -E 'userId=|uid=' || true", timeout=20)
+        m = re.search(r"userId=(\d+)", out)
+        if m:
+            return int(m.group(1))
+        m = re.search(r"\buid=(\d+)\b", out)
+        if m:
+            return int(m.group(1))
+        return None
+
+    def wm_size(self) -> Tuple[int, int]:
+        out = self.shell("wm size", timeout=15)
+        m = re.search(r"(\d+)\s*x\s*(\d+)", out)
+        if not m:
+            return (1080, 1920)
+        return (int(m.group(1)), int(m.group(2)))
+
+    def keyevent(self, code: int) -> None:
+        self.shell(f"input keyevent {code}", timeout=10)
+
+    def tap(self, x: int, y: int) -> None:
+        self.shell(f"input tap {x} {y}", timeout=10)
+
+    def monkey_run(self, pkg: str, events: int, throttle_ms: int, seed: int) -> None:
+        cmd = (
+            f"monkey -p {pkg} "
+            f"--seed {seed} "
+            f"--throttle {throttle_ms} "
+            f"--pct-syskeys 0 --pct-appswitch 0 "
+            f"--ignore-crashes --ignore-timeouts --ignore-security-exceptions "
+            f"{events}"
+        )
+        timeout = max(40, int(events * throttle_ms / 1000) + 40)
+        self.shell(cmd, timeout=timeout)
+
+
+def detect_device(adb_path: str, preferred_serial: Optional[str]) -> str:
+    cp = subprocess.run([adb_path, "devices"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    out = cp.stdout or ""
+    serials: List[str] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.startswith("List of devices"):
             continue
-        parts = ln.split()
+        parts = line.split()
         if len(parts) >= 2 and parts[1] == "device":
             serials.append(parts[0])
-    return serials[0] if len(serials) == 1 else None
+
+    if preferred_serial:
+        if preferred_serial in serials:
+            return preferred_serial
+        raise SystemExit(f"[ERROR] Device '{preferred_serial}' not found. Connected: {serials}")
+
+    if not serials:
+        raise SystemExit("[ERROR] No adb devices found. Enable USB debugging / reconnect device.")
+
+    for s in serials:
+        if not s.startswith("emulator-"):
+            return s
+    return serials[0]
 
 
-def _frida_server_healthcheck(adb: Adb) -> str:
-    cp = adb.shell("pidof frida-server", timeout=15)
-    if cp.returncode == 0 and (cp.stdout or "").strip():
-        return "OK: frida-server running (pidof)."
-
-    cp2 = adb.shell("ps -A", timeout=30)
-    txt = (cp2.stdout or "") + (cp2.stderr or "")
-    if "frida-server" in txt:
-        return "OK: frida-server running (ps -A)."
-    return "WARN: frida-server not detected via pidof/ps -A."
+def get_device_info(adb: Adb) -> DeviceInfo:
+    rel = adb.shell("getprop ro.build.version.release") or "unknown"
+    sdk = adb.shell("getprop ro.build.version.sdk") or "unknown"
+    abi = adb.shell("getprop ro.product.cpu.abi") or "unknown"
+    return DeviceInfo(serial=adb.serial, release=rel, sdk=sdk, abi=abi)
 
 
-def _parse_events(frida_output: str) -> Dict[str, int]:
+FRIDA_TAG_RE = re.compile(r"\]\[([A-Z0-9_]+)\]\s*(.*)$")
+
+
+def split_frida_events(lines: List[str]) -> Tuple[List[Dict[str, str]], Dict[str, int]]:
+    events: List[Dict[str, str]] = []
     counts: Dict[str, int] = {}
-    for ln in frida_output.splitlines():
-        ln = ln.strip()
-        if not ln:
+    for ln in lines:
+        m = FRIDA_TAG_RE.search(ln or "")
+        if not m:
             continue
-        tag = ln.split(maxsplit=1)[0]
-        if tag.isupper() and len(tag) <= 16:
-            counts[tag] = counts.get(tag, 0) + 1
-    return counts
+        tag = m.group(1).strip()
+        msg = m.group(2).strip()
+        events.append({"tag": tag, "msg": msg, "raw": ln})
+        counts[tag] = counts.get(tag, 0) + 1
+    return events, counts
 
 
-def score_dynamic(counts: Dict[str, int], frida_ok: bool) -> Tuple[int, str, List[str]]:
+def _filter_logcat_by_pid(log_lines: List[str], pid: Optional[int]) -> str:
+    if not pid:
+        return "\n".join(log_lines or [])
+    needle = f" {pid} "
+    out = []
+    for ln in (log_lines or []):
+        if needle in ln:
+            out.append(ln)
+    return "\n".join(out)
+
+
+def _clamp(x: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(x)))
+
+
+def _severity_from_score(score: int) -> str:
+    s = _clamp(score, 0, 100)
+    if s >= 80:
+        return "CRITICAL"
+    if s >= 60:
+        return "HIGH"
+    if s >= 35:
+        return "MEDIUM"
+    return "LOW"
+
+
+def score_dynamic(event_counts: Dict[str, int], net_events: List[dict], logcat_app_text: str) -> Tuple[int, str, List[str], bool, bool, List[str], Dict[str, int]]:
+    """
+    Strict scoring goals:
+      - benign apps < 20 (even with lots of TCP)
+      - malware > 60 when hard signals appear
+    Strategy:
+      - TCP is "presence" only (0..2 pts max), never a hard trigger
+      - Hard triggers (unlock): SMS/PROC/DLOAD/INTENT-danger/anti-analysis
+      - Combos boost score significantly (TCP + PROC/DLOAD/FILE, SMS + TCP etc.)
+      - If no unlock => benign cap at 18
+    """
     reasons: List[str] = []
+    unlock_triggers: List[str] = []
+
+    tcp_count = len(net_events or [])
+    # Hard tags (from JS)
+    sms = event_counts.get("SMS", 0)
+    proc = event_counts.get("PROC", 0)
+    dload = event_counts.get("DLOAD", 0)
+    fileio = event_counts.get("FILE", 0)
+    intent = event_counts.get("INTENT", 0)
+    act = event_counts.get("ACT", 0)
+    crypto = event_counts.get("CRYPTO", 0)
+    selftest = event_counts.get("SELFTEST", 0)
+
+    # Soft NET tags (if any)
+    net = event_counts.get("OKHTTP", 0) + event_counts.get("HTTPURL", 0) + event_counts.get("WEBVIEW", 0)
+    sock = event_counts.get("DNS", 0) + event_counts.get("SOCKET", 0)
+
+    key_counts = {
+        "SELFTEST": selftest,
+        "ACT": act,
+        "PROC": proc,
+        "FILE": fileio,
+        "DLOAD": dload,
+        "SMS": sms,
+        "CRYPTO": crypto,
+        "NET": net,
+        "SOCK": sock,
+        "TCP": tcp_count,
+        "NATIVE": event_counts.get("NATIVE", 0),
+    }
+
     score = 0
 
-    if not frida_ok:
-        reasons.append("Frida instrumentation failed or produced no recognizable output (+0)")
-        return 0, "LOW", reasons
+    def add(pts: int, why: str):
+        nonlocal score
+        if pts <= 0:
+            return
+        score += pts
+        reasons.append(f"{why} (+{pts})")
 
-    if counts.get("READY", 0) > 0:
-        score += 5
-        reasons.append("Frida READY observed (+5)")
+    # --- Soft signal: network presence (very low weight)
+    if tcp_count > 0 or net > 0 or sock > 0:
+        # 1 point just for "network exists"
+        add(1, f"Network presence observed (TCP={tcp_count}, NET={net}, SOCK={sock})")
+        # small extra if lots of distinct TCP observations, still benign-safe
+        if tcp_count >= 50:
+            add(1, "High volume TCP observations (still benign-weighted)")
 
-    hooks = counts.get("HOOK", 0)
-    if hooks:
-        add = min(25, hooks)
-        score += add
-        reasons.append(f"HOOK events: {hooks} (+{add})")
+    # --- Anti-analysis in app logcat (hard trigger)
+    la = (logcat_app_text or "").lower()
+    anti_app = ("frida" in la) and (("detected" in la) or ("kill" in la) or ("terminate" in la))
+    if anti_app:
+        add(18, "Anti-instrumentation reaction detected in APP logcat")
+        unlock_triggers.append("ANTI:app-logcat")
 
-    if counts.get("NATIVE", 0) > 0:
-        score += 10
-        reasons.append("Native activity observed (+10)")
+    # --- Hard triggers + weights
+    if sms > 0:
+        add(50, f"SMS/content provider access observed (SMS={sms})")
+        unlock_triggers.append("HARD:sms")
 
-    score = max(0, min(100, score))
+    if proc > 0:
+        add(25, f"Process execution observed (PROC={proc})")
+        unlock_triggers.append("HARD:proc")
 
-    if score < 20:
-        sev = "LOW"
-    elif score < 50:
-        sev = "MEDIUM"
-    elif score < 75:
-        sev = "HIGH"
-    else:
-        sev = "CRITICAL"
+    if dload > 0:
+        add(30, f"Dynamic code loading observed (DLOAD={dload})")
+        unlock_triggers.append("HARD:dload")
 
-    return score, sev, reasons
+    if intent > 0:
+        add(18, f"Dangerous intent usage observed (INTENT={intent})")
+        unlock_triggers.append("HARD:intent")
+
+    # FILE alone is common (cache). Keep moderate unless combined.
+    if fileio > 0:
+        add(8, f"File write/delete activity observed (FILE={fileio})")
+        # do NOT unlock on FILE alone
+
+    # --- Combo boosts (this is where malware jumps)
+    if (proc > 0 or dload > 0) and (tcp_count > 0 or net > 0 or sock > 0):
+        add(20, "Suspicious combo: network + exec/dynamic-load")
+        if "HARD:combo_net_exec" not in unlock_triggers:
+            unlock_triggers.append("HARD:combo_net_exec")
+
+    if fileio > 0 and (tcp_count > 0 or net > 0 or sock > 0) and (proc > 0 or dload > 0):
+        add(12, "Suspicious combo: network + exec/dload + file tampering")
+        if "HARD:combo_net_exec_file" not in unlock_triggers:
+            unlock_triggers.append("HARD:combo_net_exec_file")
+
+    if sms > 0 and (tcp_count > 0 or net > 0 or sock > 0):
+        add(30, "Critical combo: network + SMS access")
+        if "HARD:combo_net_sms" not in unlock_triggers:
+            unlock_triggers.append("HARD:combo_net_sms")
+
+    # Crypto is context only (no points by default)
+    # If you want later: only add points when combined with FILE+NET (ransom-ish)
+
+    score = _clamp(score, 0, 100)
+    malicious_unlock = len(unlock_triggers) > 0
+
+    benign_cap_applied = False
+    if not malicious_unlock and score > 18:
+        score = 18
+        benign_cap_applied = True
+        reasons.append("Benign cap applied (no hard triggers).")
+
+    sev = _severity_from_score(score)
+    return score, sev, reasons, malicious_unlock, benign_cap_applied, unlock_triggers, key_counts
 
 
-def _frida_cmd(frida_cli: str, mode: str, package: str, script_path: Path) -> List[str]:
-    base = [frida_cli, "-U", "-l", str(script_path)]
-    if mode == "spawn":
-        return base + ["-f", package, "--no-pause"]
-    return base + ["-n", package]
-
-
-def _wait_for_pid(adb: Adb, package: str, max_wait_s: int = 12) -> Optional[int]:
-    t0 = time.time()
-    while time.time() - t0 < max_wait_s:
-        pid = adb.pidof(package)
-        if pid:
-            return pid
-        time.sleep(0.5)
-    return None
-
-
-def run_frida_instrumentation(
-    package: str,
-    script_path: Path,
-    duration: int,
-    mode: str,
-    adb: Adb
-) -> Tuple[bool, int, str]:
-    frida_cli = _find_frida_cli()
-    frida_ps = _find_frida_ps()
-
-    # quick sanity (best effort)
+def read_stream_lines(proc: subprocess.Popen, sink: List[str], stop_event: threading.Event, max_lines: int = 25000):
     try:
-        _run([frida_ps, "-U"], timeout=20)
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if stop_event.is_set():
+                break
+            sink.append(line.rstrip("\n"))
+            if len(sink) >= max_lines:
+                break
     except Exception:
         pass
 
-    if mode == "attach":
-        adb.launch(package)
-        pid = _wait_for_pid(adb, package, max_wait_s=12)
-        if not pid:
-            # attach will likely fail, but we still try and capture output
-            pass
 
-    cmd = _frida_cmd(frida_cli, mode, package, script_path)
-    print(f"[INFO] Frida cmd: {' '.join(cmd)}")
+def _frida_is_retryable(err: str) -> bool:
+    e = (err or "").lower()
+    needles = [
+        "connection closed",
+        "unable to connect",
+        "timed out",
+        "timeout",
+        "not found",
+        "transport error",
+        "closed by peer",
+    ]
+    return any(n in e for n in needles)
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        universal_newlines=True,
-    )
 
-    captured: List[str] = []
-    t0 = time.time()
-
+def _get_remote_device(endpoint: str):
+    if frida is None:
+        raise RuntimeError("frida module missing")
+    mgr = frida.get_device_manager()
     try:
-        while True:
-            if proc.poll() is not None:
-                break
-
-            if proc.stdout:
-                line = proc.stdout.readline()
-                if line:
-                    line = line.rstrip("\n")
-                    captured.append(line)
-                    # Also echo to console so you see errors live
-                    print(line)
-
-            if time.time() - t0 >= duration:
-                break
-
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=8)
-            except Exception:
-                proc.kill()
+        return mgr.add_remote_device(endpoint)
     except Exception:
+        for d in mgr.enumerate_devices():
+            if getattr(d, "id", "") == endpoint:
+                return d
+        raise
+
+
+def frida_api_capture_gadget(
+    endpoint: str,
+    gadget_name: str,
+    script_source: str,
+    capture_s: int,
+    attach_timeout_s: int,
+    attached_evt: Optional[threading.Event] = None,
+) -> Tuple[List[str], str]:
+    if frida is None:
+        return [], "frida python module not installed (pip install frida)"
+
+    lines: List[str] = []
+    last_err = ""
+
+    def on_message(message: Dict[str, Any], data: Any):
         try:
-            proc.kill()
+            if message.get("type") != "send":
+                return
+            payload = message.get("payload", {})
+            if isinstance(payload, dict) and "ts" in payload and "tag" in payload and "msg" in payload:
+                lines.append(f"[{payload.get('ts')}][{payload.get('tag')}] {payload.get('msg')}")
+            else:
+                lines.append(f"[{utc_iso()}][SEND] {json.dumps(payload, ensure_ascii=False)}")
         except Exception:
             pass
 
-    out = "\n".join(captured).strip()
-    rc = proc.returncode if proc.returncode is not None else -1
+    try:
+        dev = _get_remote_device(endpoint)
+    except Exception as e:
+        return [], f"Could not create/get remote device for endpoint {endpoint}: {e}"
 
-    counts = _parse_events(out)
-    ok = (counts.get("READY", 0) > 0) or (counts.get("HOOK", 0) > 0) or (rc == 0 and len(out) > 0)
+    deadline = time.time() + max(5, int(attach_timeout_s))
+    while time.time() < deadline:
+        session = None
+        script = None
+        try:
+            session = dev.attach(gadget_name)
+            script = session.create_script(script_source)
+            script.on("message", on_message)
+            script.load()
+            if attached_evt is not None:
+                attached_evt.set()
+            time.sleep(max(3, int(capture_s)))
+            try:
+                script.unload()
+            except Exception:
+                pass
+            try:
+                session.detach()
+            except Exception:
+                pass
+            return lines, ""
+        except Exception as e:
+            last_err = str(e)
+            try:
+                if script is not None:
+                    script.unload()
+            except Exception:
+                pass
+            try:
+                if session is not None:
+                    session.detach()
+            except Exception:
+                pass
+            if _frida_is_retryable(last_err):
+                time.sleep(0.8)
+                continue
+            break
 
-    return ok, rc, out
+    return lines, last_err or "attach timeout"
 
 
-def _guess_package_from_apk_name(apk_path: Path) -> str:
-    base = apk_path.stem
-    return base.split("_")[0].strip()
+def _hex_to_ipv4(hex_ip: str) -> str:
+    try:
+        raw = bytes.fromhex(hex_ip)
+        if len(raw) != 4:
+            return hex_ip
+        return ".".join(str(b) for b in raw[::-1])
+    except Exception:
+        return hex_ip
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="CyberShadow Frida automation (device -U).")
-    ap.add_argument("--case", required=True, help="Case directory, e.g., cases/CASE_X")
-    ap.add_argument("--apk", required=True, help="Path to APK file")
-    ap.add_argument("--package", default="", help="Override package name (recommended if APK name guess fails)")
-    ap.add_argument("--tag", default="frida_run", help="Run tag for artifact naming")
-    ap.add_argument("--duration", type=int, default=25, help="Capture duration (seconds)")
-    ap.add_argument("--mode", choices=["attach", "spawn"], default="attach", help="Frida mode")
-    ap.add_argument("--script", default="src/cybershadow_dyn.js", help="Frida JS script path")
-    ap.add_argument("--serial", default="", help="ADB device serial (optional)")
-    ap.add_argument("--keep-installed", action="store_true", help="Do not uninstall app after run")
-    ap.add_argument("--no-force-stop", action="store_true", help="Do not force-stop app at end")
+def _parse_proc_net_tcp(text: str, want_uid: int) -> List[dict]:
+    out: List[dict] = []
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if not ln or ln.lower().startswith("sl"):
+            continue
+        parts = ln.split()
+        if len(parts) < 10:
+            continue
+        remote = parts[2]
+        st = parts[3]
+        uid_s = parts[7] if len(parts) > 7 else ""
+        if not uid_s.isdigit():
+            continue
+        uid = int(uid_s)
+        if uid != want_uid:
+            continue
+
+        try:
+            r_ip_hex, r_port_hex = remote.split(":")
+            r_port = int(r_port_hex, 16)
+            if r_ip_hex == "00000000" and r_port == 0:
+                continue
+            r_ip = _hex_to_ipv4(r_ip_hex) if len(r_ip_hex) == 8 else r_ip_hex
+            out.append({"remote_ip": r_ip, "remote_port": r_port, "state": st})
+        except Exception:
+            continue
+    return out
+
+
+def net_monitor_loop(adb: Adb, app_uid: int, stop_evt: threading.Event, sink: List[dict], interval_s: float = 1.0):
+    seen = set()
+    while not stop_evt.is_set():
+        try:
+            tcp = adb.shell("cat /proc/net/tcp 2>/dev/null || true", timeout=10)
+            tcp6 = adb.shell("cat /proc/net/tcp6 2>/dev/null || true", timeout=10)
+            conns = _parse_proc_net_tcp(tcp, app_uid) + _parse_proc_net_tcp(tcp6, app_uid)
+            for c in conns:
+                key = f"{c.get('remote_ip')}:{c.get('remote_port')}:{c.get('state')}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                c["ts"] = utc_iso()
+                sink.append(c)
+        except Exception:
+            pass
+        time.sleep(max(0.5, float(interval_s)))
+
+
+def driver_allow_clicks(adb: Adb, duration_s: int, stop_evt: threading.Event):
+    w, h = adb.wm_size()
+    x = int(w * 0.88)
+    y = int(h * 0.92)
+    end = time.time() + max(5, int(duration_s))
+    while time.time() < end and not stop_evt.is_set():
+        adb.keyevent(82)
+        adb.keyevent(66)
+        adb.tap(x, y)
+        time.sleep(1.0)
+
+
+def driver_monkey(adb: Adb, pkg: str, events: int, throttle_ms: int, seed: int, stop_evt: threading.Event):
+    if stop_evt.is_set():
+        return
+    adb.monkey_run(pkg, events=events, throttle_ms=throttle_ms, seed=seed)
+
+
+def post_attach_seed_driver(adb: Adb, pkg: str, seed_url: str, repeat: int, interval_s: float,
+                           attached_evt: threading.Event, sink: List[str]):
+    attached_evt.wait(timeout=25.0)
+    if not attached_evt.is_set():
+        sink.append("seed: attach wait timeout")
+        return
+    time.sleep(1.2)
+    for i in range(max(1, int(repeat))):
+        out = adb.start_view_url(pkg, seed_url)
+        sink.append(f"seed[{i+1}]: {out[:450]}")
+        time.sleep(max(1.0, float(interval_s)))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="CyberShadow • Dynamic (Gadget + UID net monitor + strict scoring).")
+    ap.add_argument("--case", dest="case_dir", required=True)
+    ap.add_argument("--package", dest="package", required=True)
+    ap.add_argument("--tag", dest="tag", default="dyn")
+    ap.add_argument("--serial", dest="serial", default="")
+
+    ap.add_argument("--endpoint", dest="endpoint", default="127.0.0.1:27042")
+    ap.add_argument("--gadget-name", dest="gadget_name", default="Gadget")
+
+    ap.add_argument("--launch", dest="launch", choices=["am", "monkey", "none"], default="am")
+
+    ap.add_argument("--seed-url", dest="seed_url", default="")
+    ap.add_argument("--seed-repeat", dest="seed_repeat", type=int, default=2)
+    ap.add_argument("--seed-interval", dest="seed_interval", type=float, default=3.0)
+
+    ap.add_argument("--drive", dest="drive", choices=["none", "allow", "monkey", "monkey+allow"], default="none")
+    ap.add_argument("--monkey-events", dest="monkey_events", type=int, default=900)
+    ap.add_argument("--throttle-ms", dest="throttle_ms", type=int, default=100)
+    ap.add_argument("--monkey-seed", dest="monkey_seed", type=int, default=1337)
+
+    ap.add_argument("--preflight", dest="preflight", type=int, default=30)
+    ap.add_argument("--capture", dest="capture", type=int, default=60)
+    ap.add_argument("--script", dest="script_path", default=str(Path("src/cybershadow_dyn.js")))
+
+    ap.add_argument("--force-stop-after", dest="force_stop_after", action="store_true")
+    ap.set_defaults(force_stop_after=True)
+
     args = ap.parse_args()
 
-    case_dir = Path(args.case)
-    _ensure_case_structure(case_dir)
+    adb_path = which_or_guess_adb()
+    serial = detect_device(adb_path, args.serial or None)
+    adb = Adb(adb_path, serial)
+    devinfo = get_device_info(adb)
 
-    artifacts_dir = case_dir / "artifacts"
-    reports_dir = case_dir / "reports"
-
-    apk_path = Path(args.apk).expanduser()
-    if not apk_path.exists():
-        print(f"[ERROR] APK not found: {apk_path}")
-        return 2
-
-    script_path = Path(args.script)
+    script_path = Path(args.script_path)
     if not script_path.exists():
-        print(f"[ERROR] Frida script not found: {script_path}")
-        return 2
+        raise SystemExit(f"[ERROR] Script not found: {script_path}")
+    script_source = script_path.read_text(encoding="utf-8", errors="replace")
 
-    adb_path = _find_adb()
-    adb = Adb(adb_path=adb_path, serial=(args.serial.strip() or None))
+    case_path = Path(args.case_dir)
+    artifacts_dir = case_path / "artifacts"
+    reports_dir = case_path / "reports"
+    case_id = case_path.name
 
-    if adb.serial is None:
-        picked = _pick_device_serial(adb)
-        if picked:
-            adb.serial = picked
+    adb.forward_remove(27042)
+    adb.forward_remove(27043)
+    adb.forward(27042, 27042)
+    adb.forward(27043, 27043)
 
-    frida_note = _frida_server_healthcheck(adb)
+    adb.logcat_clear()
+    logcat = adb.logcat_proc()
+    stop_log = threading.Event()
+    logcat_lines: List[str] = []
+    t_log = threading.Thread(target=read_stream_lines, args=(logcat, logcat_lines, stop_log, 25000), daemon=True)
+    t_log.start()
 
-    print(f"[INFO] Using adb: {adb.adb_path}")
-    if adb.serial:
-        print(f"[INFO] Using device serial: {adb.serial}")
+    launch_out = ""
+    if args.launch != "none":
+        comp = adb.resolve_main_activity(args.package)
+        if args.launch == "am" and comp:
+            launch_out = adb.start_component(comp)
+        else:
+            launch_out = adb.monkey_launch(args.package)
 
-    install_cp = adb.install(apk_path)
-    install_ok = (install_cp.returncode == 0) or ("Success" in (install_cp.stdout or ""))
+    time.sleep(1.2)
 
-    package = args.package.strip() if args.package.strip() else _guess_package_from_apk_name(apk_path)
+    pids = adb.all_package_pids(args.package)
+    app_pid = pids[0] if pids else None
+    app_uid = adb.get_app_uid(args.package)
 
-    cp_pkg = adb.shell(f"pm path {package}", timeout=30)
-    if cp_pkg.returncode != 0 or "package:" not in (cp_pkg.stdout or ""):
-        print("[ERROR] Package not found on device after install.")
-        print(f"       Tried: {package}")
-        print("       Fix: pass explicit --package com.real.package.name")
-        print("       Tip: list installed apps: adb shell pm list packages -3")
-        return 3
+    gadget_ready = False
+    deadline = time.time() + max(5, int(args.preflight))
+    while time.time() < deadline:
+        if adb.has_listener_27042():
+            gadget_ready = True
+            break
+        time.sleep(0.5)
 
-    frida_ok, frida_rc, frida_out = run_frida_instrumentation(
-        package=package,
-        script_path=script_path,
-        duration=args.duration,
-        mode=args.mode,
-        adb=adb
+    attached_evt = threading.Event()
+    seed_results: List[str] = []
+
+    seed_thread = None
+    if args.seed_url:
+        seed_thread = threading.Thread(
+            target=post_attach_seed_driver,
+            args=(adb, args.package, args.seed_url, int(args.seed_repeat), float(args.seed_interval), attached_evt, seed_results),
+            daemon=True,
+        )
+        seed_thread.start()
+
+    driver_stop = threading.Event()
+    driver_threads: List[threading.Thread] = []
+    if args.drive != "none":
+        if "allow" in args.drive:
+            t_allow = threading.Thread(target=driver_allow_clicks, args=(adb, args.capture, driver_stop), daemon=True)
+            t_allow.start()
+            driver_threads.append(t_allow)
+        if "monkey" in args.drive:
+            t_m = threading.Thread(
+                target=driver_monkey,
+                args=(adb, args.package, int(args.monkey_events), int(args.throttle_ms), int(args.monkey_seed), driver_stop),
+                daemon=True,
+            )
+            t_m.start()
+            driver_threads.append(t_m)
+
+    net_stop = threading.Event()
+    net_events: List[dict] = []
+    t_net = None
+    if app_uid is not None:
+        t_net = threading.Thread(target=net_monitor_loop, args=(adb, app_uid, net_stop, net_events, 1.0), daemon=True)
+        t_net.start()
+
+    frida_lines: List[str] = []
+    frida_err = ""
+    attached_pids: List[int] = []
+
+    if gadget_ready:
+        frida_lines, frida_err = frida_api_capture_gadget(
+            endpoint=args.endpoint,
+            gadget_name=args.gadget_name,
+            script_source=script_source,
+            capture_s=args.capture,
+            attach_timeout_s=args.preflight,
+            attached_evt=attached_evt,
+        )
+        attached_pids = [app_pid] if app_pid is not None else []
+    else:
+        frida_err = "Gadget not ready (listener 27042 not detected)."
+
+    driver_stop.set()
+    for t in driver_threads:
+        try:
+            t.join(timeout=1.0)
+        except Exception:
+            pass
+
+    net_stop.set()
+    if t_net is not None:
+        try:
+            t_net.join(timeout=1.0)
+        except Exception:
+            pass
+
+    stop_log.set()
+    try:
+        if logcat.poll() is None:
+            logcat.terminate()
+    except Exception:
+        pass
+    try:
+        t_log.join(timeout=1.0)
+    except Exception:
+        pass
+
+    if seed_thread is not None:
+        try:
+            seed_thread.join(timeout=0.2)
+        except Exception:
+            pass
+
+    if args.force_stop_after:
+        adb.force_stop(args.package)
+
+    events, counts = split_frida_events(frida_lines)
+    logcat_app_text = _filter_logcat_by_pid(logcat_lines[-2000:], app_pid)
+
+    score, severity, reasons, malicious_unlock, benign_cap_applied, unlock_triggers, key_counts = score_dynamic(
+        counts, net_events=net_events, logcat_app_text=logcat_app_text
     )
 
-    counts = _parse_events(frida_out)
-    score, severity, reasons = score_dynamic(counts, frida_ok)
+    if key_counts.get("SELFTEST", 0) == 0:
+        reasons.append("WARNING: SELFTEST not seen (wrong script path or old script).")
 
-    ts = _utc_compact()
-    artifact_name = f"apk_dynamic__{args.tag}__{ts}.json"
+    artifact_name = f"apk_dynamic__{args.tag}__{utc_now_stamp()}.json"
     artifact_path = artifacts_dir / artifact_name
 
-    artifact: Dict[str, Any] = {
-        "type": "apk_dynamic",
-        "created_utc": _utc_now_str(),
-        "case": str(case_dir),
-        "apk_path": str(apk_path),
-        "package": package,
+    artifact = {
+        "kind": "apk_dynamic",
+        "case_id": case_id,
+        "package": args.package,
         "tag": args.tag,
-        "mode": args.mode,
-        "duration_s": args.duration,
-        "adb_serial": adb.serial or "",
-        "install_ok": bool(install_ok),
-        "install_stdout": (install_cp.stdout or "")[-4000:],
-        "install_stderr": (install_cp.stderr or "")[-4000:],
-        "frida_server_note": frida_note,
-        "frida_ok": bool(frida_ok),
-        "frida_return_code": int(frida_rc),
-        "event_counts": counts,
-        "reasons": reasons,
-        "severity": severity,
-        "score": int(score),
-        "frida_output_tail": "\n".join(frida_out.splitlines()[-300:]),
+        "device": f"{devinfo.serial} (Android {devinfo.release}, sdk {devinfo.sdk}, abi {devinfo.abi})",
+        "created_at_utc": utc_iso(),
+        "runtime": {
+            "transport": "gadget",
+            "endpoint": args.endpoint,
+            "gadget_ready": bool(gadget_ready),
+            "frida_api": "python",
+            "frida_attach_error": frida_err,
+            "launch_out": launch_out[:800],
+            "seed_results": seed_results[:100],
+            "package_pids": pids,
+            "app_pid": app_pid,
+            "app_uid": app_uid,
+            "attached_pids": attached_pids,
+            "event_counts": counts,
+            "frida_output_lines": int(len(frida_lines)),
+            "frida_output_tail": frida_lines[-2000:],
+            "logcat_tail": logcat_lines[-2000:],
+            "net_observed": net_events[:2000],
+            "net_observed_count": len(net_events),
+            "capture_seconds": int(args.capture),
+            "launch": args.launch,
+            "seed_url": args.seed_url,
+            "seed_repeat": int(args.seed_repeat),
+            "seed_interval": float(args.seed_interval),
+            "drive": args.drive,
+            "monkey_events": int(args.monkey_events),
+            "throttle_ms": int(args.throttle_ms),
+            "monkey_seed": int(args.monkey_seed),
+        },
+        "scoring": {
+            "score": int(score),
+            "severity": severity,
+            "reasons": reasons,
+            "malicious_unlock": bool(malicious_unlock),
+            "benign_cap_applied": bool(benign_cap_applied),
+            "unlock_triggers": unlock_triggers,
+            "key_counts": key_counts,
+        },
+        "events": events[:3000],
     }
 
-    artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+    save_json(artifact_path, artifact)
 
-    apk_report_path = None
-    if write_apk_dynamic_html:
-        try:
-            apk_report_path = reports_dir / f"apk_dynamic_report__{artifact_path.stem}.html"
-            write_apk_dynamic_html(artifact_path, apk_report_path)
-        except Exception as e:
-            print(f"[WARN] Failed to write APK HTML report: {e}")
+    report_name = f"apk_dynamic_report__{Path(artifact_name).stem}.html"
+    report_path = reports_dir / report_name
+    ensure_parent(report_path)
+    report_path.write_text(
+        "<html><body><pre>" + json.dumps(artifact, indent=2, ensure_ascii=False) + "</pre></body></html>",
+        encoding="utf-8"
+    )
 
-    if write_case_html:
-        try:
-            write_case_html(case_dir, reports_dir / "case_report.html")
-        except Exception as e:
-            print(f"[WARN] Failed to write Case HTML report: {e}")
-
-    if not args.no_force_stop:
-        adb.force_stop(package)
-
-    if not args.keep_installed:
-        adb.uninstall(package)
-
-    print("\n== PIPELINE SUMMARY ==")
-    print(f"Case: {case_dir}")
-    print("Risk mode: latest")
-    print(f"APK: {package}")
-    print(f"Instrumentation: {'OK' if frida_ok else 'FAILED'}")
+    print("== PIPELINE SUMMARY ==")
+    print(f"Case: {args.case_dir}")
+    print(f"APK: {args.package}")
+    print("Transport: gadget")
+    print(f"Gadget ready: {bool(gadget_ready)} | Endpoint: {args.endpoint}")
+    print(f"AppPID: {app_pid}")
+    print(f"PkgPIDs: {pids}")
+    print(f"AttachedPIDs: {attached_pids}")
+    print(f"FridaLines: {len(frida_lines)}")
+    print(f"KeyCounts: {json.dumps(key_counts)}")
+    print(f"UnlockTriggers: {unlock_triggers}")
     print(f"Severity: {severity}")
-    print(f"Score: {score} / 100")
-    print(f"Artifact: {artifact_path}")
-    if apk_report_path:
-        print(f"APK Report: {apk_report_path}")
-    print(f"Case Report: {reports_dir / 'case_report.html'}")
-    print("\n[DONE] return code: 0")
-    return 0
+    print(f"Score: {int(score)} / 100")
+    print(f"Unlock: {'YES' if malicious_unlock else 'NO'} | Cap: {'YES' if benign_cap_applied else 'NO'}")
+    print(f"Artifact: {str(artifact_path)}")
+    print(f"APK Report: {str(report_path)}")
+    print("[DONE] return code: 0")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

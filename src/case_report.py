@@ -1,12 +1,13 @@
 # src/case_report.py
+from __future__ import annotations
+
 import json
 import re
 from pathlib import Path
 from datetime import datetime
-from typing import Literal, Optional, Any
+from typing import Literal, Any
 
-
-RiskMode = Literal["latest", "max"]
+RiskMode = Literal["latest", "max", "mean"]
 
 
 # --------------------------- IO helpers ---------------------------
@@ -78,261 +79,193 @@ def _dedupe_evidence(evidence: list[dict]) -> list[dict]:
     return out
 
 
-# --------------------------- Artifact loading ---------------------------
-
-def _load_artifacts(case_path: Path, pattern: str) -> list[dict]:
-    artifacts_dir = case_path / "artifacts"
-    files = sorted(artifacts_dir.glob(pattern))
-    out = []
-    for p in files:
-        try:
-            obj = _load_json(p)
-            obj["_artifact_name"] = p.name
-            obj["_artifact_mtime_utc"] = _fmt_fs_ts_mtime(p)
-            obj["_artifact_mtime_ts"] = float(p.stat().st_mtime)
-            out.append(obj)
-        except Exception:
-            pass
-    return out
+def sev_badge_class(sev: str) -> str:
+    s = (sev or "UNKNOWN").upper().strip()
+    if s not in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}:
+        return "UNKNOWN"
+    return s
 
 
-# --------------------------- Reason parsing ---------------------------
+# --------------------------- Artifact parsing ---------------------------
 
-def _parse_reason_weight(reason: str) -> int:
-    # Accept reasons like "Something (+45)" OR "Something +45"
-    if not isinstance(reason, str):
-        return 0
-    m = re.search(r"\(\s*\+\s*(\d+)\s*\)", reason)
-    if m:
-        return _safe_int(m.group(1), 0)
-    m = re.search(r"\+\s*(\d+)\b", reason)
-    if m:
-        return _safe_int(m.group(1), 0)
-    return 0
+def _pick_artifacts(artifacts_dir: Path, glob_pat: str) -> list[Path]:
+    files = sorted(list(artifacts_dir.glob(glob_pat)), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files
 
 
-def _sort_reasons(reasons: list[str]) -> list[tuple[str, int]]:
-    rs = [(r, _parse_reason_weight(r)) for r in (reasons or []) if isinstance(r, str)]
-    rs.sort(key=lambda t: (-t[1], str(t[0])))
-    return rs
+def _extract_static_fields(obj: dict) -> tuple[int, str, list[str]]:
+    scoring = obj.get("scoring", {}) or {}
+    score = _safe_int(scoring.get("score", 0), 0)
+    sev = str(scoring.get("severity", "") or "").upper().strip()
+    reasons = scoring.get("reasons", []) or []
+    if not sev:
+        sev = _final_severity_from_score(score)
+    return score, sev, [str(x) for x in reasons]
 
-
-# --------------------------- Static normalization ---------------------------
-
-def _normalize_apk_static(apk_list: list[dict]) -> list[dict]:
-    """
-    STATIC:
-    - SCORE is source of truth.
-    - Severity derived from score to avoid inconsistencies.
-    - Engine severity kept as reference.
-    """
-    out = []
-    for a in apk_list or []:
-        scoring = a.get("scoring", {}) or {}
-
-        score = _clamp(_safe_int(scoring.get("score", 0), 0), 0, 100)
-        derived_sev = _final_severity_from_score(score)
-        engine_sev = (scoring.get("severity") or "").upper().strip() or None
-
-        reasons = scoring.get("reasons", []) or []
-        reasons_sorted = _sort_reasons(reasons)
-
-        out.append(
-            {
-                "kind": "apk_static",
-                "artifact_name": a.get("_artifact_name", ""),
-                "artifact_mtime_utc": a.get("_artifact_mtime_utc", "unknown"),
-                "artifact_mtime_ts": float(a.get("_artifact_mtime_ts", 0) or 0),
-                "app_name": a.get("app_name", ""),
-                "package": a.get("package", ""),
-                "version_name": a.get("version_name", ""),
-                "version_code": a.get("version_code", ""),
-                "score": score,
-                "severity": derived_sev,
-                "engine_severity": engine_sev,
-                "sensitive_permissions": (scoring.get("sensitive_permissions", []) or []),
-                "reasons": [r for r, _w in reasons_sorted] if reasons_sorted else ["No major risk indicators detected."],
-                "reasons_weighted": reasons_sorted,
-                "certificate_fp": (a.get("certificate", {}) or {}).get("sha256_fingerprint", "unknown"),
-                "iocs": a.get("iocs", {}) or {},
-            }
-        )
-
-    out.sort(key=lambda m: m.get("artifact_mtime_ts", 0), reverse=True)
-    return out
-
-
-# --------------------------- Dynamic normalization (artifact-truth) ---------------------------
 
 def _extract_dyn_fields(obj: dict) -> tuple[int, str, list[str], bool, bool]:
     scoring = obj.get("scoring", {}) or {}
-    score = _clamp(_safe_int(scoring.get("score", 0), 0), 0, 100)
-    sev = _final_severity_from_score(score)
+    score = _safe_int(scoring.get("score", 0), 0)
+    sev = str(scoring.get("severity", "") or "").upper().strip()
     reasons = scoring.get("reasons", []) or []
+    if not sev:
+        sev = _final_severity_from_score(score)
+
     malicious_unlock = bool(scoring.get("malicious_unlock", False))
     benign_cap_applied = bool(scoring.get("benign_cap_applied", False))
     return score, sev, [str(x) for x in reasons], malicious_unlock, benign_cap_applied
 
 
-def _normalize_apk_dynamic(dyn_list: list[dict]) -> list[dict]:
-    """
-    DYNAMIC:
-    - Trust the dynamic artifact scoring (already benign-aware in apk_dynamic.py)
-    - Keep engine fields (if present) as reference only
-    - Preserve iocs / iocs_split / iocs_scoring for UI transparency
-    """
-    out = []
-    for d in dyn_list or []:
-        score, sev, reasons, malicious_unlock, benign_cap_applied = _extract_dyn_fields(d)
-        reasons_sorted = _sort_reasons(reasons)
-
-        pkg = (d.get("package") or "")
-        app_name = (d.get("app_name") or "")
-        device = d.get("device", {}) or {}
-        device_serial = ""
-        if isinstance(device, dict):
-            device_serial = str(device.get("serial", "") or "")
-        elif isinstance(device, str):
-            device_serial = device
-
-        # engine reference (optional)
-        engine_score = None
-        engine_sev = None
-        if "engine_score" in d:
-            engine_score = _safe_int(d.get("engine_score", 0), 0)
-        if "engine_severity" in d:
-            engine_sev = (d.get("engine_severity") or "").upper().strip() or None
-
-        iocs = d.get("iocs", {}) or {}
-        iocs_split = d.get("iocs_split", {}) or {}
-        iocs_scoring = d.get("iocs_scoring", {}) or {}
-
-        # tag best-effort: from artifact name pattern
-        tag = ""
-        an = str(d.get("_artifact_name", "") or "")
-        m = re.match(r"apk_dynamic__([^_]+)__", an)
-        if m:
-            tag = m.group(1)
-
+def _normalize_static(artifacts: list[Path]) -> list[dict]:
+    out: list[dict] = []
+    for p in artifacts:
+        obj = _load_json(p)
+        score, sev, reasons = _extract_static_fields(obj)
         out.append(
             {
-                "kind": "apk_dynamic",
-                "artifact_name": d.get("_artifact_name", ""),
-                "artifact_mtime_utc": d.get("_artifact_mtime_utc", "unknown"),
-                "artifact_mtime_ts": float(d.get("_artifact_mtime_ts", 0) or 0),
-                "app_name": app_name,
-                "package": pkg,
-                "tag": tag,
-                "device_serial": device_serial,
-                "score": score,
-                "severity": sev,
-                "reasons": [r for r, _w in reasons_sorted] if reasons_sorted else (reasons or ["No runtime indicators recorded."]),
-                "reasons_weighted": reasons_sorted,
-                "engine_score": engine_score,
-                "engine_severity": engine_sev,
-                "malicious_unlock": bool(malicious_unlock),
-                "benign_cap_applied": bool(benign_cap_applied),
-                "iocs": iocs,
-                "iocs_split": iocs_split,
-                "iocs_scoring": iocs_scoring,
+                "artifact_name": p.name,
+                "artifact_mtime_utc": _fmt_fs_ts_mtime(p),
+                "score": _clamp(score, 0, 100),
+                "severity": _final_severity_from_score(score),
+                "engine_severity": sev,  # informational
+                "reasons": reasons[:60],
+                "app_name": obj.get("app_name", "") or obj.get("app", "") or "",
+                "package": obj.get("package", "") or "",
+                "version_name": obj.get("version_name", "") or "",
+                "version_code": obj.get("version_code", "") or "",
+                "kind": "apk_static",
             }
         )
-
-    out.sort(key=lambda m: m.get("artifact_mtime_ts", 0), reverse=True)
     return out
 
 
+def _normalize_dynamic(artifacts: list[Path]) -> list[dict]:
+    out: list[dict] = []
+    for p in artifacts:
+        obj = _load_json(p)
+        score, sev, reasons, malicious_unlock, benign_cap_applied = _extract_dyn_fields(obj)
+
+        runtime = obj.get("runtime", {}) or {}
+        tag = obj.get("tag", "") or ""
+        device = obj.get("device", "") or ""
+        device_serial = ""
+        try:
+            device_serial = str(device).split()[0]
+        except Exception:
+            device_serial = ""
+
+        out.append(
+            {
+                "artifact_name": p.name,
+                "artifact_mtime_utc": _fmt_fs_ts_mtime(p),
+                "score": _clamp(score, 0, 100),
+                "severity": _final_severity_from_score(score),
+                "engine_score": score,      # informational
+                "engine_severity": sev,     # informational
+                "reasons": reasons[:80],
+                "malicious_unlock": bool(malicious_unlock),
+                "benign_cap_applied": bool(benign_cap_applied),
+                "tag": tag,
+                "device_serial": device_serial,
+                "app_name": obj.get("app_name", "") or "",
+                "package": obj.get("package", "") or "",
+                "kind": "apk_dynamic",
+                "runtime": {
+                    "endpoint": runtime.get("endpoint"),
+                    "gadget_ready": runtime.get("gadget_ready"),
+                    "frida_attach_error": runtime.get("frida_attach_error"),
+                    "event_counts": runtime.get("event_counts") or {},
+                    "key_counts": runtime.get("key_counts") or {},
+                    "unlock_triggers": runtime.get("unlock_triggers") or [],
+                },
+                # optional, if present in your pipeline
+                "iocs_split": obj.get("iocs_split") or {},
+            }
+        )
+    return out
+
+
+def _mean_int(values: list[int]) -> int:
+    v = [int(x) for x in values if x is not None]
+    if not v:
+        return 0
+    return int(round(sum(v) / float(len(v))))
+
+
 def _case_malicious_unlock(apk_static: list[dict], apk_dynamic: list[dict]) -> bool:
-    """
-    Unlock rules:
-      - any dynamic artifact says malicious_unlock
-      - OR static score >= 35 (MEDIUM+) as fallback (static found serious indicators)
-    """
+    # If ANY dynamic artifact is unlocked -> allow high scoring
     for d in apk_dynamic or []:
         if bool(d.get("malicious_unlock", False)):
             return True
 
+    # Optional: if static has explicit high-risk reasons (keywords), unlock too
+    # (kept conservative; tweak later)
     for s in apk_static or []:
-        sc = _safe_int(s.get("score", 0), 0)
-        if sc >= 35:
+        rs = " ".join([str(x) for x in (s.get("reasons") or [])]).lower()
+        if any(k in rs for k in ["accessibility", "device admin", "read_sms", "send_sms", "banking trojan", "dropper"]):
             return True
 
     return False
 
 
-# --------------------------- Case summary ---------------------------
-
 def build_case_summary(case_dir: str, risk_mode: RiskMode = "latest") -> dict:
     case_path = Path(case_dir)
     case = _load_json(case_path / "case.json")
+    artifacts_dir = case_path / "artifacts"
 
-    static_list = _load_artifacts(case_path, "apk_static__*.json")
-    dyn_list = _load_artifacts(case_path, "apk_dynamic__*.json")
+    static_paths = _pick_artifacts(artifacts_dir, "apk_static__*.json")
+    dynamic_paths = _pick_artifacts(artifacts_dir, "apk_dynamic__*.json")
 
-    apk_static = _normalize_apk_static(static_list)
-    apk_dynamic = _normalize_apk_dynamic(dyn_list)
+    apk_static = _normalize_static(static_paths)
+    apk_dynamic = _normalize_dynamic(dynamic_paths)
 
-    # Aggregate IOCs across both (raw union)
-    iocs = {"urls": set(), "domains": set(), "ips": set(), "emails": set()}
+    # build “scored items” list to support latest/max
+    scored_items = []
+    for row in apk_static + apk_dynamic:
+        try:
+            mtime = (artifacts_dir / row["artifact_name"]).stat().st_mtime
+        except Exception:
+            mtime = 0.0
+        scored_items.append((mtime, int(row.get("score", 0)), row.get("artifact_name", ""), row.get("kind", "")))
 
-    def _merge_iocs(obj_iocs: dict):
-        if not isinstance(obj_iocs, dict):
-            return
-        for k in list(iocs.keys()):
-            for v in (obj_iocs.get(k, []) or []):
-                if v:
-                    iocs[k].add(str(v))
+    scored_items.sort(key=lambda t: t[0], reverse=True)
+    scores = [int(s) for (_mt, s, _a, _k) in scored_items]
 
-    # static artifacts: use their iocs dict
-    for a in static_list or []:
-        _merge_iocs(a.get("iocs", {}) or {})
+    latest_score = scores[0] if scores else 0
+    latest_artifact = scored_items[0][2] if scored_items else ""
+    latest_kind = scored_items[0][3] if scored_items else ""
 
-    # dynamic artifacts: use full iocs dict (not scoring-only)
-    for d in apk_dynamic or []:
-        _merge_iocs(d.get("iocs", {}) or {})
-
-    # scored items across both
-    scored_items: list[tuple[float, int, str, str]] = []  # (mtime_ts, score, artifact_name, kind)
-    scores: list[int] = []
-
-    for m in apk_static:
-        sc = _clamp(_safe_int(m.get("score", 0), 0), 0, 100)
-        scores.append(sc)
-        scored_items.append((float(m.get("artifact_mtime_ts", 0) or 0), sc, m.get("artifact_name", ""), "apk_static"))
-
-    for d in apk_dynamic:
-        sc = _clamp(_safe_int(d.get("score", 0), 0), 0, 100)
-        scores.append(sc)
-        scored_items.append((float(d.get("artifact_mtime_ts", 0) or 0), sc, d.get("artifact_name", ""), "apk_dynamic"))
+    # per-module latest
+    latest_static_score = _safe_int(apk_static[0]["score"], 0) if apk_static else 0
+    latest_dynamic_score = _safe_int(apk_dynamic[0]["score"], 0) if apk_dynamic else 0
 
     rm = (risk_mode or "latest").lower().strip()
-    if rm not in ("latest", "max"):
-        rm = "latest"
-
-    latest_artifact = ""
-    latest_kind = ""
-    latest_score = 0
-
-    if scored_items:
-        scored_items.sort(key=lambda t: t[0], reverse=True)
-        _mt, latest_score, latest_artifact, latest_kind = scored_items[0]
-
     if rm == "max":
         final_score = max(scores) if scores else 0
+        risk_note = "worst-case across all artifacts"
+    elif rm == "mean":
+        # mean of the most recent module outputs (stable for dashboard)
+        bucket = []
+        if apk_static:
+            bucket.append(_clamp(latest_static_score, 0, 100))
+        if apk_dynamic:
+            bucket.append(_clamp(latest_dynamic_score, 0, 100))
+        final_score = _mean_int(bucket) if bucket else 0
+        risk_note = "mean of latest static + latest dynamic"
     else:
         final_score = latest_score if scores else 0
+        risk_note = "verdict from most recent artifact"
 
     final_score = _clamp(final_score, 0, 100)
 
-    # benign-aware cap
+    # benign-aware cap (GOLD RULE): benign apps must be < 20
     malicious_unlock = _case_malicious_unlock(apk_static, apk_dynamic)
     benign_cap_applied = False
-    if not malicious_unlock and final_score > 20:
-        final_score = 20
+    if not malicious_unlock and final_score >= 20:
+        final_score = 19
         benign_cap_applied = True
 
     final_sev = _final_severity_from_score(final_score)
-
     evidence = _dedupe_evidence(case.get("evidence", []) or [])
 
     modules_present = []
@@ -349,54 +282,49 @@ def build_case_summary(case_dir: str, risk_mode: RiskMode = "latest") -> dict:
         "apk_static": apk_static,
         "apk_dynamic": apk_dynamic,
         "modules_present": modules_present,
-        "aggregate_iocs": {k: sorted(list(v)) for k, v in iocs.items()},
         "risk": {
             "risk_mode": rm,
-            "final_score": final_score,
-            "final_severity": final_sev,
-            "latest_artifact": latest_artifact or "",
-            "latest_kind": latest_kind or "",
-            "latest_score": _clamp(latest_score, 0, 100),
+            "risk_note": risk_note,
+            "score": int(final_score),
+            "severity": final_sev,
+            "latest_artifact": latest_artifact,
+            "latest_kind": latest_kind,
+            "latest_static_score": int(_clamp(latest_static_score, 0, 100)),
+            "latest_dynamic_score": int(_clamp(latest_dynamic_score, 0, 100)),
             "malicious_unlock": bool(malicious_unlock),
             "benign_cap_applied": bool(benign_cap_applied),
         },
     }
 
 
-# --------------------------- HTML writer ---------------------------
-
 def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
-    case_path = Path(case_dir)
     summary = build_case_summary(case_dir, risk_mode=risk_mode)
 
-    sev = summary["risk"]["final_severity"]
-    score = _safe_int(summary["risk"]["final_score"], 0)
-    rm = summary["risk"].get("risk_mode", "latest")
-    latest_art = summary["risk"].get("latest_artifact", "") or ""
-    latest_kind = summary["risk"].get("latest_kind", "") or ""
+    case_path = Path(case_dir)
+    score = int(summary["risk"]["score"])
+    sev = str(summary["risk"]["severity"])
+    rm = str(summary["risk"]["risk_mode"])
+    latest_art = str(summary["risk"]["latest_artifact"] or "")
+    latest_kind = str(summary["risk"]["latest_kind"] or "")
+    score_band = _score_band(score)
+
     benign_cap = bool(summary["risk"].get("benign_cap_applied", False))
     unlock = bool(summary["risk"].get("malicious_unlock", False))
 
-    def sev_badge_class(s: str) -> str:
-        s = (s or "UNKNOWN").upper()
-        return s if s in {"LOW", "MEDIUM", "HIGH", "CRITICAL"} else "UNKNOWN"
-
-    score_band = _score_band(score)
-
-    # Evidence table rows
+    # Evidence table
     evidence_rows = ""
-    for e in summary["evidence"]:
+    for e in summary.get("evidence", []) or []:
         evidence_rows += (
             "<tr>"
             f"<td>{e.get('name','')}</td>"
-            f"<td>{e.get('type','')}</td>"
-            f"<td><code>{e.get('sha256','')}</code></td>"
+            f"<td><span class='pill'>{e.get('type','')}</span></td>"
+            f"<td class='mono'>{e.get('sha256','')}</td>"
             "</tr>"
         )
     if not evidence_rows:
-        evidence_rows = "<tr><td colspan='3'><i>No evidence registered.</i></td></tr>"
+        evidence_rows = "<tr><td colspan='3'><i>No evidence added yet.</i></td></tr>"
 
-    # APK STATIC rows + why
+    # Static rows + why
     static_rows = ""
     static_why = ""
     for m in summary.get("apk_static", []) or []:
@@ -410,7 +338,11 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
         engine_sev = m.get("engine_severity", None)
         ref_note = ""
         if engine_sev and engine_sev != sev_m:
-            ref_note = f"<div class='small muted'>Engine severity (ref): <b>{engine_sev}</b> • Derived severity (used): <b>{sev_m}</b></div>"
+            ref_note = (
+                "<div class='small muted'>"
+                f"Engine severity (ref): <b>{engine_sev}</b> • Derived severity (used): <b>{sev_m}</b>"
+                "</div>"
+            )
 
         static_rows += (
             "<tr>"
@@ -442,7 +374,7 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
     if not static_why:
         static_why = "<i>No static scoring reasons available.</i>"
 
-    # APK DYNAMIC rows + why
+    # Dynamic rows + why
     dyn_rows = ""
     dyn_why = ""
     for d in summary.get("apk_dynamic", []) or []:
@@ -450,50 +382,14 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
         score_d = _safe_int(d.get("score", 0), 0)
         band_d = _score_band(score_d)
 
-        engine_score = d.get("engine_score", None)
-        engine_sev = d.get("engine_severity", None)
-
         reasons = (d.get("reasons", []) or [])
         reasons_html = "<ul class='compact'>" + "".join(f"<li>{r}</li>" for r in reasons) + "</ul>"
-
-        # IOC split (if present)
-        split = d.get("iocs_split", {}) or {}
-        b = (split.get("benign") or {}) if isinstance(split, dict) else {}
-        s = (split.get("suspicious") or {}) if isinstance(split, dict) else {}
-
-        benign_domains = (b.get("domains") or []) if isinstance(b, dict) else []
-        benign_emails = (b.get("emails") or []) if isinstance(b, dict) else []
-        susp_domains = (s.get("domains") or []) if isinstance(s, dict) else []
-        susp_emails = (s.get("emails") or []) if isinstance(s, dict) else []
-
-        split_note = ""
-        if benign_domains or benign_emails or susp_domains or susp_emails:
-            def _fmt_list(items: list[str]) -> str:
-                if not items:
-                    return "<i>None</i>"
-                return "<br>".join(items[:25]) + ("<br><span class='muted'>…</span>" if len(items) > 25 else "")
-
-            split_note = (
-                "<div class='small muted' style='margin-top:8px;'>"
-                "<b>IOC split:</b> suspicious vs benign (noise-filtered)"
-                "</div>"
-                "<table style='margin-top:8px;'>"
-                "<tr><th>Suspicious domains</th><td class='small'>" + _fmt_list([str(x) for x in susp_domains]) + "</td></tr>"
-                "<tr><th>Suspicious emails</th><td class='small'>" + _fmt_list([str(x) for x in susp_emails]) + "</td></tr>"
-                "<tr><th>Benign domains</th><td class='small'>" + _fmt_list([str(x) for x in benign_domains]) + "</td></tr>"
-                "<tr><th>Benign emails</th><td class='small'>" + _fmt_list([str(x) for x in benign_emails]) + "</td></tr>"
-                "</table>"
-            )
 
         unlock_flag = bool(d.get("malicious_unlock", False))
         cap_flag = bool(d.get("benign_cap_applied", False))
 
         ref_note = "<div class='small muted'>"
         parts = []
-        if engine_score is not None:
-            parts.append(f"Engine score (ref): <b>{int(engine_score)}</b>/100")
-        if engine_sev:
-            parts.append(f"Engine severity (ref): <b>{engine_sev}</b>")
         parts.append(f"Conservative score (used): <b>{score_d}</b>/100")
         parts.append(f"Unlock: <b>{'YES' if unlock_flag else 'NO'}</b>")
         parts.append(f"Cap applied: <b>{'YES' if cap_flag else 'NO'}</b>")
@@ -521,7 +417,6 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
             f"</div>"
             f"{ref_note}"
             f"{reasons_html}"
-            f"{split_note}"
             "</div>"
         )
 
@@ -530,21 +425,19 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
     if not dyn_why:
         dyn_why = "<i>No dynamic scoring reasons available.</i>"
 
-    # Aggregate IOCs (union)
-    agg = summary["aggregate_iocs"]
-    urls = agg.get("urls", []) or []
-    domains = agg.get("domains", []) or []
-    ips = agg.get("ips", []) or []
-    emails = agg.get("emails", []) or []
-
-    def _join_or_none(items: list[str]) -> str:
-        return "<br>".join(items) if items else "<i>None</i>"
-
     cap_note = ""
     if benign_cap and not unlock:
-        cap_note = "<div class='small muted' style='margin-top:8px;'><b>Benign-aware cap:</b> no high-confidence malware indicators detected → score capped at <b>20/100</b>.</div>"
+        cap_note = (
+            "<div class='small muted' style='margin-top:8px;'>"
+            "<b>Benign-aware cap:</b> no high-confidence malware indicators detected → score capped at <b>19/100</b>."
+            "</div>"
+        )
     if unlock:
-        cap_note = "<div class='small muted' style='margin-top:8px;'><b>Malicious unlock:</b> strong indicators detected → score may exceed 20/100.</div>"
+        cap_note = (
+            "<div class='small muted' style='margin-top:8px;'>"
+            "<b>Malicious unlock:</b> strong indicators detected → score may exceed 19/100."
+            "</div>"
+        )
 
     html = f"""<!doctype html>
 <html>
@@ -700,22 +593,18 @@ th {{
 .LOW {{
   background: rgba(0,255,160,0.10);
   color: rgba(140,255,210,0.95);
-  box-shadow: 0 0 16px rgba(0,255,170,0.14);
 }}
 .MEDIUM {{
   background: rgba(255,190,0,0.12);
   color: rgba(255,210,110,0.95);
-  box-shadow: 0 0 16px rgba(255,190,0,0.12);
 }}
 .HIGH {{
   background: rgba(255,80,80,0.12);
   color: rgba(255,170,170,0.95);
-  box-shadow: 0 0 16px rgba(255,80,80,0.12);
 }}
 .CRITICAL {{
   background: rgba(255,40,120,0.14);
   color: rgba(255,170,210,0.95);
-  box-shadow: 0 0 16px rgba(255,40,120,0.14);
 }}
 .UNKNOWN {{
   background: rgba(255,255,255,0.06);
@@ -725,25 +614,21 @@ th {{
 .SCORE_GREEN {{
   background: rgba(0,255,170,0.10);
   color: rgba(140,255,210,0.95);
-  box-shadow: 0 0 18px rgba(0,255,170,0.16);
   border-color: rgba(0,255,170,0.22);
 }}
 .SCORE_YELLOW {{
   background: rgba(255,205,0,0.12);
   color: rgba(255,220,130,0.95);
-  box-shadow: 0 0 18px rgba(255,205,0,0.14);
   border-color: rgba(255,205,0,0.22);
 }}
 .SCORE_ORANGE {{
   background: rgba(255,130,0,0.12);
   color: rgba(255,190,140,0.95);
-  box-shadow: 0 0 18px rgba(255,130,0,0.14);
   border-color: rgba(255,130,0,0.22);
 }}
 .SCORE_RED {{
   background: rgba(255,60,60,0.12);
   color: rgba(255,175,175,0.95);
-  box-shadow: 0 0 18px rgba(255,60,60,0.14);
   border-color: rgba(255,60,60,0.22);
 }}
 
@@ -771,7 +656,7 @@ th {{
       <span class="pill"><b>Latest kind:</b> <span class="mono">{latest_kind}</span></span>
     </div>
     <div class="small muted" style="margin-top:10px;">
-      Latest = verdict from most recent artifact • Max = worst-case across artifacts
+      Latest = verdict from most recent artifact • Max = worst-case across artifacts • Mean = avg(latest static, latest dynamic)
     </div>
     {cap_note}
   </div>
@@ -812,7 +697,7 @@ th {{
   <div class="card">
     <div class="row">
       <h2 style="margin:0;">APK Dynamic Analysis Summary</h2>
-      <span class="muted">(artifact scoring is benign-aware; engine fields shown only if present)</span>
+      <span class="muted">(artifact scoring is benign-aware)</span>
     </div>
     <table>
       <tr>
@@ -824,22 +709,9 @@ th {{
     <div class="hr"></div>
     <div class="row">
       <h2 style="margin:0;">Why this dynamic score</h2>
-      <span class="muted">runtime indicators + IOC split (noise-filtered)</span>
+      <span class="muted">runtime indicators</span>
     </div>
     {dyn_why}
-  </div>
-
-  <div class="card">
-    <div class="row">
-      <h2 style="margin:0;">Aggregate IOCs</h2>
-      <span class="muted">(raw union across APK artifacts)</span>
-    </div>
-    <table>
-      <tr><th>URLs</th><td class="small">{_join_or_none(urls)}</td></tr>
-      <tr><th>Domains</th><td class="small">{_join_or_none(domains)}</td></tr>
-      <tr><th>IPs</th><td class="small">{_join_or_none(ips)}</td></tr>
-      <tr><th>Emails</th><td class="small">{_join_or_none(emails)}</td></tr>
-    </table>
   </div>
 
   <div class="card">
@@ -847,7 +719,7 @@ th {{
       <h2 style="margin:0;">Reproducibility (Environment)</h2>
       <span class="muted">snapshot used to reproduce the run</span>
     </div>
-    <pre>{json.dumps(summary.get("env",{}), indent=2)}</pre>
+    <pre>{json.dumps(summary.get("env",{}), indent=2, ensure_ascii=False)}</pre>
   </div>
 
 </div>

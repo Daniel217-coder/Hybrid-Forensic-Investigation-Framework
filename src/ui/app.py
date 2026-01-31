@@ -1,4 +1,6 @@
 # src/ui/app.py
+from __future__ import annotations
+
 import os
 import re
 import sys
@@ -7,6 +9,7 @@ import queue
 import threading
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
 
 import customtkinter as ctk
@@ -147,10 +150,12 @@ class RunSummary:
     top_reasons: List[str] = field(default_factory=list)
 
     def best_report_path(self) -> Optional[str]:
+        # Prefer Case Report if present
         for k in ["Case Report", "APK Report"]:
             p = self.paths.get(k)
             if p and os.path.exists(p):
                 return p
+
         for p in self.paths.values():
             if p and p.lower().endswith(".html") and os.path.exists(p):
                 return p
@@ -183,7 +188,7 @@ class LogParser:
         for key, rx in PATH_KEYS.items():
             mm = rx.search(s)
             if mm:
-                p = mm.group(1).strip()
+                p = mm.group(1).strip().strip('"').strip("'")
                 p_abs = os.path.abspath(p) if not os.path.isabs(p) else p
                 self.summary.paths[key] = p_abs
 
@@ -315,13 +320,15 @@ class CyberShadowHub(ctk.CTk):
 
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-        body.grid_columnconfigure(0, weight=0, minsize=460)
+        body.grid_columnconfigure(0, weight=0, minsize=520)
         body.grid_columnconfigure(1, weight=1)
         body.grid_rowconfigure(0, weight=1)
 
         # Left: Controls
         left = ctk.CTkFrame(body, fg_color="#0B1220", corner_radius=16)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        left.grid_rowconfigure(0, weight=1)
+        left.grid_columnconfigure(0, weight=1)
 
         self.left_tabs = ctk.CTkTabview(
             left,
@@ -332,7 +339,7 @@ class CyberShadowHub(ctk.CTk):
             segmented_button_unselected_color="#0A1222",
             segmented_button_unselected_hover_color="#111B2F",
         )
-        self.left_tabs.pack(fill="both", expand=True, padx=14, pady=14)
+        self.left_tabs.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
 
         self.tab_apk = self.left_tabs.add("APK Analyzer")
         self.tab_dyn = self.left_tabs.add("Dynamic (Frida)")
@@ -375,7 +382,6 @@ class CyberShadowHub(ctk.CTk):
         self._build_summary(self.tab_summary)
         self._build_report_viewer(self.tab_report)
 
-        # if we had pending summary before widgets existed, render it now
         if self._pending_summary_text is not None:
             try:
                 self._set_summary_text(self._pending_summary_text)
@@ -492,183 +498,50 @@ class CyberShadowHub(ctk.CTk):
             except Exception:
                 pass
 
-    # ---------------- Dynamic Controls (Frida) ----------------
-    def _build_dynamic_controls(self, parent):
-        wrap = ctk.CTkFrame(parent, fg_color="transparent")
-        wrap.pack(fill="both", expand=True, padx=10, pady=10)
+    # ---------------- Controls: APK Analyzer ----------------
+    def _build_apk_controls(self, parent):
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(
-            wrap, text="Dynamic Analysis (Frida on Emulator/Device)",
-            text_color="#E5E7EB",
-            font=ctk.CTkFont(size=14, weight="bold")
-        ).pack(anchor="w", pady=(0, 10))
+        # Scroll area
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent", corner_radius=0)
+        scroll.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 6))
+        scroll.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(
-            wrap,
-            text=("Folosește Case Folder + APK File din tab-ul «APK Analyzer».\n"
-                  "Aici setezi doar package name + opțiuni Frida.\n"
-                  "Runner: python -m src.frida_auto"),
-            text_color="#94A3B8",
-            justify="left"
-        ).pack(anchor="w", pady=(0, 14))
+        # Sticky action bar (always visible)
+        action = ctk.CTkFrame(parent, fg_color="transparent")
+        action.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        action.grid_columnconfigure(0, weight=1)
+        action.grid_columnconfigure(1, weight=1)
 
-        # ---- Package
-        ctk.CTkLabel(
-            wrap, text="Package Name",
-            text_color="#E5E7EB", font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(anchor="w", pady=(0, 6))
-
-        self.dyn_pkg_entry = ctk.CTkEntry(wrap, placeholder_text="me.hackerchick.catima")
-        self.dyn_pkg_entry.pack(fill="x", pady=(0, 12))
-
-        # ---- Dynamic Tag
-        ctk.CTkLabel(
-            wrap, text="Dynamic Tag",
-            text_color="#E5E7EB", font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(anchor="w", pady=(0, 6))
-
-        self.dyn_tag_entry = ctk.CTkEntry(wrap, placeholder_text="dyn")
-        self.dyn_tag_entry.pack(fill="x", pady=(0, 12))
-        self.dyn_tag_entry.insert(0, "dyn")
-
-        # ---- Mode + Timeout
-        row_opts = ctk.CTkFrame(wrap, fg_color="transparent")
-        row_opts.pack(fill="x", pady=(0, 12))
-        row_opts.grid_columnconfigure((0, 1, 2), weight=1)
-
-        ctk.CTkLabel(
-            row_opts, text="Mode", text_color="#E5E7EB",
-            font=ctk.CTkFont(size=13, weight="bold")
-        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
-
-        ctk.CTkLabel(
-            row_opts, text="Timeout (sec)", text_color="#E5E7EB",
-            font=ctk.CTkFont(size=13, weight="bold")
-        ).grid(row=0, column=1, sticky="w", padx=(0, 8))
-
-        ctk.CTkLabel(
-            row_opts, text="ADB Serial (optional)", text_color="#E5E7EB",
-            font=ctk.CTkFont(size=13, weight="bold")
-        ).grid(row=0, column=2, sticky="w")
-
-        self.dyn_mode_var = ctk.StringVar(value="attach")
-        self.dyn_mode_menu = ctk.CTkOptionMenu(
-            row_opts,
-            values=["attach", "spawn"],
-            variable=self.dyn_mode_var,
-            fg_color="#0A1222",
-            button_color="#1E3A8A",
-            button_hover_color="#2563EB",
-        )
-        self.dyn_mode_menu.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(6, 0))
-
-        self.dyn_timeout_entry = ctk.CTkEntry(row_opts, placeholder_text="35")
-        self.dyn_timeout_entry.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(6, 0))
-        self.dyn_timeout_entry.insert(0, "35")
-
-        self.dyn_serial_entry = ctk.CTkEntry(row_opts, placeholder_text="emulator-5554 (leave blank for auto)")
-        self.dyn_serial_entry.grid(row=1, column=2, sticky="ew", pady=(6, 0))
-
-        # ---- Script + Frida-server (optional)
-        ctk.CTkLabel(
-            wrap, text="Frida JS Script",
-            text_color="#E5E7EB", font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(anchor="w", pady=(10, 6))
-
-        row_script = ctk.CTkFrame(wrap, fg_color="transparent")
-        row_script.pack(fill="x", pady=(0, 12))
-        row_script.grid_columnconfigure(0, weight=1)
-
-        self.dyn_script_entry = ctk.CTkEntry(row_script, placeholder_text="src/cybershadow_dyn.js")
-        self.dyn_script_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        self.dyn_script_entry.insert(0, os.path.join("src", "dynamic", "cybershadow_dyn.js"))
-
-        ctk.CTkButton(
-            row_script, text="Browse Script", command=self._browse_dyn_script,
-            fg_color="#1E3A8A", hover_color="#2563EB", height=36
-        ).grid(row=0, column=1)
-
-        ctk.CTkLabel(
-            wrap, text="Frida-server (optional push/start)",
-            text_color="#E5E7EB", font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(anchor="w", pady=(0, 6))
-
-        row_srv = ctk.CTkFrame(wrap, fg_color="transparent")
-        row_srv.pack(fill="x", pady=(0, 14))
-        row_srv.grid_columnconfigure(0, weight=1)
-
-        self.dyn_frida_server_entry = ctk.CTkEntry(row_srv, placeholder_text=r"C:\path\to\frida-server-android-x86_64")
-        self.dyn_frida_server_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-
-        ctk.CTkButton(
-            row_srv, text="Browse frida-server", command=self._browse_dyn_frida_server,
-            fg_color="#1E3A8A", hover_color="#2563EB", height=36
-        ).grid(row=0, column=1)
-
-        # ---- Run/Stop
-        ctrl = ctk.CTkFrame(wrap, fg_color="transparent")
-        ctrl.pack(fill="x", pady=(4, 0))
-        ctrl.grid_columnconfigure(0, weight=1)
-        ctrl.grid_columnconfigure(1, weight=1)
-
-        self.btn_run_dyn = ctk.CTkButton(
-            ctrl, text="RUN DYNAMIC (FRIDA)", command=self._run_dynamic,
-            fg_color="#7C3AED", hover_color="#8B5CF6",
+        self.btn_run = ctk.CTkButton(
+            action, text="RUN APK ANALYSIS", command=self._run_apk,
+            fg_color="#1D4ED8", hover_color="#2563EB",
             height=44, font=ctk.CTkFont(size=14, weight="bold")
         )
-        self.btn_run_dyn.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.btn_run.grid(row=0, column=0, sticky="ew", padx=(0, 10))
 
-        self.btn_stop_dyn = ctk.CTkButton(
-            ctrl, text="STOP", command=self._stop,
+        self.btn_stop = ctk.CTkButton(
+            action, text="STOP", command=self._stop,
             fg_color="#7F1D1D", hover_color="#DC2626",
             height=44, font=ctk.CTkFont(size=14, weight="bold"),
             state="disabled"
         )
-        self.btn_stop_dyn.grid(row=0, column=1, sticky="ew")
-
-        ctk.CTkLabel(
-            wrap,
-            text=("Tip: dacă aplicația moare imediat (anti-frida / crash), mărește timeout și folosește mode=spawn.\n"
-                  "Dacă ai frida-server deja pornit manual pe emulator, lasă câmpul frida-server gol."),
-            text_color="#94A3B8",
-            justify="left"
-        ).pack(anchor="w", pady=(12, 0))
-
-    def _browse_dyn_script(self):
-        path = filedialog.askopenfilename(
-            title="Select Frida JS Script",
-            filetypes=[("JavaScript", "*.js"), ("All files", "*.*")]
-        )
-        if path:
-            self.dyn_script_entry.delete(0, "end")
-            self.dyn_script_entry.insert(0, path)
-
-    def _browse_dyn_frida_server(self):
-        path = filedialog.askopenfilename(
-            title="Select frida-server binary",
-            filetypes=[("All files", "*.*")]
-        )
-        if path:
-            self.dyn_frida_server_entry.delete(0, "end")
-            self.dyn_frida_server_entry.insert(0, path)
-
-    def _build_apk_controls(self, parent):
-        wrap = ctk.CTkFrame(parent, fg_color="transparent")
-        wrap.pack(fill="both", expand=True, padx=10, pady=10)
+        self.btn_stop.grid(row=0, column=1, sticky="ew")
 
         # ---- Case Folder
         ctk.CTkLabel(
-            wrap, text="Case Folder", text_color="#E5E7EB",
+            scroll, text="Case Folder", text_color="#E5E7EB",
             font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(anchor="w", pady=(0, 6))
+        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
 
-        row_case = ctk.CTkFrame(wrap, fg_color="transparent")
-        row_case.pack(fill="x", pady=(0, 12))
+        row_case = ctk.CTkFrame(scroll, fg_color="transparent")
+        row_case.grid(row=1, column=0, sticky="ew", pady=(0, 12))
         row_case.grid_columnconfigure(0, weight=1)
 
-        self.case_entry = ctk.CTkEntry(row_case, placeholder_text="cases/CASE_005")
+        self.case_entry = ctk.CTkEntry(row_case, placeholder_text="cases/CASE_001")
         self.case_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        self.case_entry.insert(0, r"cases/CASE_005")
+        self.case_entry.insert(0, r".\cases\CASE_001")
 
         ctk.CTkButton(
             row_case, text="Browse Case", command=self._browse_case,
@@ -677,12 +550,12 @@ class CyberShadowHub(ctk.CTk):
 
         # ---- Risk mode
         ctk.CTkLabel(
-            wrap, text="Case Verdict Mode", text_color="#E5E7EB",
+            scroll, text="Case Verdict Mode", text_color="#E5E7EB",
             font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(anchor="w", pady=(0, 6))
+        ).grid(row=2, column=0, sticky="w", pady=(0, 6))
 
-        row_risk = ctk.CTkFrame(wrap, fg_color="transparent")
-        row_risk.pack(fill="x", pady=(0, 12))
+        row_risk = ctk.CTkFrame(scroll, fg_color="transparent")
+        row_risk.grid(row=3, column=0, sticky="ew", pady=(0, 12))
         row_risk.grid_columnconfigure(0, weight=1)
 
         self.risk_mode_var = ctk.StringVar(value="latest")
@@ -694,7 +567,7 @@ class CyberShadowHub(ctk.CTk):
             button_color="#1E3A8A",
             button_hover_color="#2563EB",
         )
-        self.risk_mode_menu.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.risk_mode_menu.grid(row=0, column=0, sticky="w", padx=(0, 10))
 
         ctk.CTkLabel(
             row_risk,
@@ -704,12 +577,12 @@ class CyberShadowHub(ctk.CTk):
 
         # ---- APK File
         ctk.CTkLabel(
-            wrap, text="APK File", text_color="#E5E7EB",
+            scroll, text="APK File", text_color="#E5E7EB",
             font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(anchor="w", pady=(0, 6))
+        ).grid(row=4, column=0, sticky="w", pady=(0, 6))
 
-        row_apk = ctk.CTkFrame(wrap, fg_color="transparent")
-        row_apk.pack(fill="x", pady=(0, 12))
+        row_apk = ctk.CTkFrame(scroll, fg_color="transparent")
+        row_apk.grid(row=5, column=0, sticky="ew", pady=(0, 12))
         row_apk.grid_columnconfigure(0, weight=1)
 
         self.apk_entry = ctk.CTkEntry(row_apk, placeholder_text=r"C:\path\to\app.apk")
@@ -722,61 +595,219 @@ class CyberShadowHub(ctk.CTk):
 
         # ---- Tag
         ctk.CTkLabel(
-            wrap, text="Tag", text_color="#E5E7EB",
+            scroll, text="Tag", text_color="#E5E7EB",
             font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(anchor="w", pady=(0, 6))
+        ).grid(row=6, column=0, sticky="w", pady=(0, 6))
 
-        self.tag_entry = ctk.CTkEntry(wrap, placeholder_text="fennec")
-        self.tag_entry.pack(fill="x", pady=(0, 14))
-        self.tag_entry.insert(0, "fennec")
+        self.tag_entry = ctk.CTkEntry(scroll, placeholder_text="tag")
+        self.tag_entry.grid(row=7, column=0, sticky="ew", pady=(0, 10))
+        self.tag_entry.insert(0, "run1")
 
-        # ---- Run/Stop
-        ctrl = ctk.CTkFrame(wrap, fg_color="transparent")
-        ctrl.pack(fill="x", pady=(4, 0))
-        ctrl.grid_columnconfigure(0, weight=1)
-        ctrl.grid_columnconfigure(1, weight=1)
+        # ---- Load report button
+        self.btn_load_report = ctk.CTkButton(
+            scroll, text="LOAD REPORT INTO VIEWER", command=self._load_report_into_viewer,
+            fg_color="#0F766E", hover_color="#14B8A6", height=38,
+            state="disabled"
+        )
+        self.btn_load_report.grid(row=8, column=0, sticky="ew", pady=(8, 10))
 
-        self.btn_run = ctk.CTkButton(
-            ctrl, text="RUN APK ANALYSIS", command=self._run_apk,
-            fg_color="#1D4ED8", hover_color="#2563EB",
+        # ---- Artifact manager
+        self._build_artifact_manager(scroll)
+
+        ctk.CTkLabel(
+            scroll,
+            text="Tip: Selectează un artifact pentru Preview în Quick Summary; apoi Load Report deschide report-ul lui.",
+            text_color="#94A3B8",
+            font=ctk.CTkFont(size=12)
+        ).grid(row=999, column=0, sticky="w", pady=(8, 0))
+
+    # ---------------- Controls: Dynamic ----------------
+    def _build_dynamic_controls(self, parent):
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        # Scroll area
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent", corner_radius=0)
+        scroll.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 6))
+        scroll.grid_columnconfigure(0, weight=1)
+
+        # Sticky action bar
+        action = ctk.CTkFrame(parent, fg_color="transparent")
+        action.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        action.grid_columnconfigure(0, weight=1)
+        action.grid_columnconfigure(1, weight=1)
+
+        self.btn_run_dyn = ctk.CTkButton(
+            action, text="RUN DYNAMIC (FRIDA)", command=self._run_dynamic,
+            fg_color="#7C3AED", hover_color="#8B5CF6",
             height=44, font=ctk.CTkFont(size=14, weight="bold")
         )
-        self.btn_run.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.btn_run_dyn.grid(row=0, column=0, sticky="ew", padx=(0, 10))
 
-        self.btn_stop = ctk.CTkButton(
-            ctrl, text="STOP", command=self._stop,
+        self.btn_stop_dyn = ctk.CTkButton(
+            action, text="STOP", command=self._stop,
             fg_color="#7F1D1D", hover_color="#DC2626",
             height=44, font=ctk.CTkFont(size=14, weight="bold"),
             state="disabled"
         )
-        self.btn_stop.grid(row=0, column=1, sticky="ew")
-
-        self.btn_load_report = ctk.CTkButton(
-            wrap, text="LOAD REPORT INTO VIEWER", command=self._load_report_into_viewer,
-            fg_color="#0F766E", hover_color="#14B8A6", height=38,
-            state="disabled"
-        )
-        self.btn_load_report.pack(fill="x", pady=(12, 8))
-
-        # ---- Artifact manager
-        self._build_artifact_manager(wrap)
+        self.btn_stop_dyn.grid(row=0, column=1, sticky="ew")
 
         ctk.CTkLabel(
-            wrap,
-            text="Tip: Selectează un artifact pentru Preview în Quick Summary; apoi Load Report deschide report-ul lui.",
+            scroll, text="Dynamic Analysis (Frida Gadget / Device)",
+            text_color="#E5E7EB",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        ctk.CTkLabel(
+            scroll,
+            text=("Flow recomandat (telefon real): APK repack cu Frida Gadget + adb forward 27042.\n"
+                  "UI rulează automat: preflight → attach → seed-url → monkey.\n"
+                  "Runner: python .\\src\\frida_auto.py"),
             text_color="#94A3B8",
-            font=ctk.CTkFont(size=12)
-        ).pack(anchor="w", pady=(8, 0))
+            justify="left"
+        ).grid(row=1, column=0, sticky="w", pady=(0, 12))
 
-        # IMPORTANT: NU mai facem refresh aici (UI-ul nu e complet încă).
-        # Refresh se face în __init__ după ce există summary_text etc.
+        # Package
+        ctk.CTkLabel(
+            scroll, text="Package Name",
+            text_color="#E5E7EB", font=ctk.CTkFont(size=13, weight="bold")
+        ).grid(row=2, column=0, sticky="w", pady=(0, 6))
+        self.dyn_pkg_entry = ctk.CTkEntry(scroll, placeholder_text="org.mozilla.fennec_fdroid")
+        self.dyn_pkg_entry.grid(row=3, column=0, sticky="ew", pady=(0, 12))
 
+        # Tag
+        ctk.CTkLabel(
+            scroll, text="Dynamic Tag",
+            text_color="#E5E7EB", font=ctk.CTkFont(size=13, weight="bold")
+        ).grid(row=4, column=0, sticky="w", pady=(0, 6))
+        self.dyn_tag_entry = ctk.CTkEntry(scroll, placeholder_text="dyn")
+        self.dyn_tag_entry.grid(row=5, column=0, sticky="ew", pady=(0, 12))
+        self.dyn_tag_entry.insert(0, "dyn")
+
+        # Row: preflight / capture
+        row1 = ctk.CTkFrame(scroll, fg_color="transparent")
+        row1.grid(row=6, column=0, sticky="ew", pady=(0, 12))
+        row1.grid_columnconfigure((0, 1), weight=1)
+
+        ctk.CTkLabel(row1, text="Preflight (sec)", text_color="#E5E7EB",
+                    font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ctk.CTkLabel(row1, text="Capture (sec)", text_color="#E5E7EB",
+                    font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=1, sticky="w")
+
+        self.dyn_preflight_entry = ctk.CTkEntry(row1, placeholder_text="30")
+        self.dyn_preflight_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(6, 0))
+        self.dyn_preflight_entry.insert(0, "30")
+
+        self.dyn_capture_entry = ctk.CTkEntry(row1, placeholder_text="90")
+        self.dyn_capture_entry.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        self.dyn_capture_entry.insert(0, "90")
+
+        # Row: drive / monkey / throttle
+        row2 = ctk.CTkFrame(scroll, fg_color="transparent")
+        row2.grid(row=7, column=0, sticky="ew", pady=(0, 12))
+        row2.grid_columnconfigure((0, 1, 2), weight=1)
+
+        ctk.CTkLabel(row2, text="Drive", text_color="#E5E7EB",
+                    font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ctk.CTkLabel(row2, text="Monkey events", text_color="#E5E7EB",
+                    font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=1, sticky="w", padx=(0, 8))
+        ctk.CTkLabel(row2, text="Throttle (ms)", text_color="#E5E7EB",
+                    font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=2, sticky="w")
+
+        self.dyn_drive_var = ctk.StringVar(value="monkey+allow")
+        self.dyn_drive_menu = ctk.CTkOptionMenu(
+            row2,
+            values=["none", "monkey", "monkey+allow"],
+            variable=self.dyn_drive_var,
+            fg_color="#0A1222",
+            button_color="#1E3A8A",
+            button_hover_color="#2563EB",
+        )
+        self.dyn_drive_menu.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(6, 0))
+
+        self.dyn_monkey_events_entry = ctk.CTkEntry(row2, placeholder_text="2500")
+        self.dyn_monkey_events_entry.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(6, 0))
+        self.dyn_monkey_events_entry.insert(0, "2500")
+
+        self.dyn_throttle_entry = ctk.CTkEntry(row2, placeholder_text="80")
+        self.dyn_throttle_entry.grid(row=1, column=2, sticky="ew", pady=(6, 0))
+        self.dyn_throttle_entry.insert(0, "80")
+
+        # Seed URL
+        ctk.CTkLabel(
+            scroll, text="Seed URL (optional)",
+            text_color="#E5E7EB", font=ctk.CTkFont(size=13, weight="bold")
+        ).grid(row=8, column=0, sticky="w", pady=(0, 6))
+        self.dyn_seed_url_entry = ctk.CTkEntry(scroll, placeholder_text="https://example.com")
+        self.dyn_seed_url_entry.grid(row=9, column=0, sticky="ew", pady=(0, 12))
+        self.dyn_seed_url_entry.insert(0, "https://example.com")
+
+        # Seed repeat / interval / serial
+        row3 = ctk.CTkFrame(scroll, fg_color="transparent")
+        row3.grid(row=10, column=0, sticky="ew", pady=(0, 12))
+        row3.grid_columnconfigure((0, 1, 2), weight=1)
+
+        ctk.CTkLabel(row3, text="Seed repeat", text_color="#E5E7EB",
+                    font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ctk.CTkLabel(row3, text="Seed interval (sec)", text_color="#E5E7EB",
+                    font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=1, sticky="w", padx=(0, 8))
+        ctk.CTkLabel(row3, text="ADB Serial (optional)", text_color="#E5E7EB",
+                    font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=2, sticky="w")
+
+        self.dyn_seed_repeat_entry = ctk.CTkEntry(row3, placeholder_text="4")
+        self.dyn_seed_repeat_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(6, 0))
+        self.dyn_seed_repeat_entry.insert(0, "0")
+
+        self.dyn_seed_interval_entry = ctk.CTkEntry(row3, placeholder_text="2")
+        self.dyn_seed_interval_entry.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(6, 0))
+        self.dyn_seed_interval_entry.insert(0, "3")
+
+        self.dyn_serial_entry = ctk.CTkEntry(row3, placeholder_text="RF8N92WCTPP")
+        self.dyn_serial_entry.grid(row=1, column=2, sticky="ew", pady=(6, 0))
+
+        # Script path
+        ctk.CTkLabel(
+            scroll, text="Frida JS Script",
+            text_color="#E5E7EB", font=ctk.CTkFont(size=13, weight="bold")
+        ).grid(row=11, column=0, sticky="w", pady=(0, 6))
+        row_script = ctk.CTkFrame(scroll, fg_color="transparent")
+        row_script.grid(row=12, column=0, sticky="ew", pady=(0, 12))
+        row_script.grid_columnconfigure(0, weight=1)
+
+        self.dyn_script_entry = ctk.CTkEntry(row_script, placeholder_text="src/cybershadow_dyn.js")
+        self.dyn_script_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.dyn_script_entry.insert(0, os.path.join("src", "cybershadow_dyn.js"))
+
+        ctk.CTkButton(
+            row_script, text="Browse Script", command=self._browse_dyn_script,
+            fg_color="#1E3A8A", hover_color="#2563EB", height=36
+        ).grid(row=0, column=1)
+
+        ctk.CTkLabel(
+            scroll,
+            text=("Important: dacă folosești telefon real cu Gadget, NU rula alt frida client în paralel.\n"
+                  "UI va rula frida_auto și apoi va genera case_report automat."),
+            text_color="#94A3B8",
+            justify="left"
+        ).grid(row=13, column=0, sticky="w", pady=(8, 0))
+
+    def _browse_dyn_script(self):
+        path = filedialog.askopenfilename(
+            title="Select Frida JS Script",
+            filetypes=[("JavaScript", "*.js"), ("All files", "*.*")]
+        )
+        if path:
+            self.dyn_script_entry.delete(0, "end")
+            self.dyn_script_entry.insert(0, path)
+
+    # ---------------- Artifact manager ----------------
     def _build_artifact_manager(self, parent):
         box = ctk.CTkFrame(parent, fg_color="#050A14", corner_radius=16)
-        box.pack(fill="both", expand=False, pady=(8, 0))
+        box.grid(sticky="ew", pady=(8, 0))
+        box.grid_columnconfigure(0, weight=1)
 
         header = ctk.CTkFrame(box, fg_color="transparent")
-        header.pack(fill="x", padx=10, pady=(10, 6))
+        header.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
         header.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
@@ -794,7 +825,7 @@ class CyberShadowHub(ctk.CTk):
         self.artifacts_count_label.grid(row=0, column=1, sticky="e")
 
         row_btns = ctk.CTkFrame(box, fg_color="transparent")
-        row_btns.pack(fill="x", padx=10, pady=(0, 8))
+        row_btns.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
         row_btns.grid_columnconfigure((0, 1, 2), weight=1)
 
         self.btn_art_refresh = ctk.CTkButton(
@@ -815,8 +846,8 @@ class CyberShadowHub(ctk.CTk):
         )
         self.btn_art_clean.grid(row=0, column=2, sticky="ew")
 
-        self.art_scroll = ctk.CTkScrollableFrame(box, fg_color="transparent", corner_radius=0, height=160)
-        self.art_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.art_scroll = ctk.CTkScrollableFrame(box, fg_color="transparent", corner_radius=0, height=180)
+        self.art_scroll.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
 
     def _build_placeholder(self, parent, title: str):
         wrap = ctk.CTkFrame(parent, fg_color="transparent")
@@ -836,7 +867,6 @@ class CyberShadowHub(ctk.CTk):
             justify="left"
         ).pack(anchor="w")
 
-    # ---------------- Artifact management ----------------
     def _case_abs(self) -> str:
         c = self.case_entry.get().strip()
         if not c:
@@ -923,7 +953,6 @@ class CyberShadowHub(ctk.CTk):
             )
             rb.pack(anchor="w", pady=4)
 
-        # select latest if current selection invalid
         cur = self._artifact_radio_var.get().strip()
         if not cur or not os.path.exists(cur):
             self._artifact_radio_var.set(paths[0])
@@ -1091,11 +1120,8 @@ class CyberShadowHub(ctk.CTk):
         if self._proc is None:
             self._set_badges(score100, None)
 
-        if self._find_report_for_selected_artifact():
+        if self._find_report_for_selected_artifact() or self._parser.summary.best_report_path():
             self.btn_load_report.configure(state="normal")
-        else:
-            if self._parser.summary.best_report_path():
-                self.btn_load_report.configure(state="normal")
 
     def _render_summary(self):
         blocks: List[str] = []
@@ -1193,19 +1219,16 @@ class CyberShadowHub(ctk.CTk):
             self.apk_entry.insert(0, path)
 
     def _set_running_ui(self, running: bool):
-        # APK tab
         try:
             self.btn_run.configure(state="disabled" if running else "normal")
             self.btn_stop.configure(state="normal" if running else "disabled")
         except Exception:
             pass
-        # Dynamic tab
         try:
             self.btn_run_dyn.configure(state="disabled" if running else "normal")
             self.btn_stop_dyn.configure(state="normal" if running else "disabled")
         except Exception:
             pass
-        # Report load button
         try:
             if running:
                 self.btn_load_report.configure(state="disabled")
@@ -1213,21 +1236,14 @@ class CyberShadowHub(ctk.CTk):
             pass
 
     def _augment_env_for_tools(self, env: Dict[str, str]) -> Dict[str, str]:
-        """
-        Make it robust on Windows:
-         - add venv Scripts to PATH (so frida/frida-ps found)
-         - add Android SDK platform-tools (so adb found by frida_auto if needed)
-        """
         env = dict(env or {})
         path = env.get("PATH", "")
 
-        # venv Scripts (Windows) / bin (Linux/mac)
         exe_dir = os.path.dirname(sys.executable)
         if exe_dir and os.path.isdir(exe_dir):
             if exe_dir not in path:
                 path = exe_dir + os.pathsep + path
 
-        # common Android SDK platform-tools
         local = os.environ.get("LOCALAPPDATA", "")
         guess_adb = os.path.join(local, "Android", "Sdk", "platform-tools")
         if guess_adb and os.path.isdir(guess_adb):
@@ -1268,7 +1284,6 @@ class CyberShadowHub(ctk.CTk):
 
         self._append_log("------------------------------------------------------------\n")
         self._append_log("[INFO] Starting APK analysis...\n")
-
         self._set_running_ui(True)
 
         py = sys.executable
@@ -1285,7 +1300,7 @@ class CyberShadowHub(ctk.CTk):
         env["ANDROGUARD_LOGLEVEL"] = "ERROR"
         env["LOGURU_LEVEL"] = "ERROR"
 
-        t = threading.Thread(target=self._runner, args=(cmd, env), daemon=True)
+        t = threading.Thread(target=self._runner_pipeline, args=([cmd], env), daemon=True)
         t.start()
 
     def _run_dynamic(self):
@@ -1294,16 +1309,11 @@ class CyberShadowHub(ctk.CTk):
             return
 
         case_folder = self.case_entry.get().strip()
-        apk_path = self.apk_entry.get().strip()
         risk_mode = (self.risk_mode_var.get() or "latest").strip()
 
         pkg = (self.dyn_pkg_entry.get() if hasattr(self, "dyn_pkg_entry") else "").strip()
         tag = (self.dyn_tag_entry.get() if hasattr(self, "dyn_tag_entry") else "").strip() or "dyn"
-        mode = (self.dyn_mode_var.get() if hasattr(self, "dyn_mode_var") else "attach").strip() or "attach"
         script_path = (self.dyn_script_entry.get() if hasattr(self, "dyn_script_entry") else "").strip()
-        frida_server = (self.dyn_frida_server_entry.get() if hasattr(self, "dyn_frida_server_entry") else "").strip()
-        serial = (self.dyn_serial_entry.get() if hasattr(self, "dyn_serial_entry") else "").strip()
-        timeout_s = (self.dyn_timeout_entry.get() if hasattr(self, "dyn_timeout_entry") else "35").strip()
 
         if not case_folder:
             messagebox.showerror("Missing input", "Case Folder este gol (tab APK Analyzer).")
@@ -1317,22 +1327,28 @@ class CyberShadowHub(ctk.CTk):
         if not script_path:
             messagebox.showerror("Missing input", "Frida JS Script lipsește.")
             return
-        # allow relative; just check if exists relative to cwd
-        if not os.path.exists(script_path):
-            # try project-root style (cwd)
-            if not os.path.exists(os.path.abspath(script_path)):
-                messagebox.showerror("Missing input", f"Frida JS Script nu există:\n{script_path}")
-                return
-
-        if frida_server and not os.path.exists(frida_server):
-            messagebox.showerror("Missing input", f"frida-server nu există:\n{frida_server}")
+        if not os.path.exists(script_path) and not os.path.exists(os.path.abspath(script_path)):
+            messagebox.showerror("Missing input", f"Frida JS Script nu există:\n{script_path}")
             return
 
-        try:
-            timeout_i = int(timeout_s)
-            timeout_i = max(5, min(timeout_i, 600))
-        except Exception:
-            timeout_i = 35
+        # read numeric entries
+        def _int_entry(e, default, lo, hi):
+            try:
+                v = int(e.get().strip())
+                return max(lo, min(hi, v))
+            except Exception:
+                return default
+
+        preflight = _int_entry(self.dyn_preflight_entry, 30, 5, 600)
+        capture = _int_entry(self.dyn_capture_entry, 90, 5, 1800)
+        monkey_events = _int_entry(self.dyn_monkey_events_entry, 2500, 0, 50000)
+        throttle = _int_entry(self.dyn_throttle_entry, 80, 0, 5000)
+        seed_repeat = _int_entry(self.dyn_seed_repeat_entry, 0, 0, 50)
+        seed_interval = _int_entry(self.dyn_seed_interval_entry, 3, 0, 60)
+
+        drive = (self.dyn_drive_var.get() if hasattr(self, "dyn_drive_var") else "monkey+allow").strip()
+        seed_url = (self.dyn_seed_url_entry.get() if hasattr(self, "dyn_seed_url_entry") else "").strip()
+        serial = (self.dyn_serial_entry.get() if hasattr(self, "dyn_serial_entry") else "").strip()
 
         self._parser = LogParser()
         self._stop_flag.clear()
@@ -1345,37 +1361,45 @@ class CyberShadowHub(ctk.CTk):
 
         self._append_log("------------------------------------------------------------\n")
         self._append_log("[INFO] Starting Dynamic (Frida) analysis...\n")
-
         self._set_running_ui(True)
 
         py = sys.executable
-        cmd = [
-            py, "-m", "src.frida_auto",
+
+        # 1) run your gadget frida_auto script (direct path)
+        frida_auto_path = os.path.join("src", "frida_auto.py")
+        cmd_dyn = [
+            py, frida_auto_path,
             "--case", case_folder,
             "--package", pkg,
             "--tag", tag,
-            "--mode", mode,
-            "--timeout", str(timeout_i),
-            "--risk-mode", risk_mode,
+            "--capture", str(capture),
+            "--preflight", str(preflight),
+            "--drive", drive,
+            "--monkey-events", str(monkey_events),
+            "--throttle-ms", str(throttle),
             "--script", script_path
         ]
 
-        # optional apk install
-        if apk_path and os.path.exists(apk_path):
-            cmd.extend(["--apk", apk_path])
-
-        # optional serial
         if serial:
-            cmd.extend(["--serial", serial])
+            cmd_dyn.extend(["--serial", serial])
 
-        # optional frida-server push/start
-        if frida_server:
-            cmd.extend(["--frida-server", frida_server])
+        # optional seed-url (if your frida_auto supports it)
+        # keep it safe: only add if non-empty
+        if seed_url:
+            cmd_dyn.extend(["--seed-url", seed_url, "--seed-repeat", str(seed_repeat), "--seed-interval", str(seed_interval)])
+
+        # 2) generate case-report after dynamic run (so you can view it)
+        cmd_case = [
+            py, "-m", "src.main",
+            "case-report",
+            "--case", case_folder,
+            "--risk-mode", risk_mode
+        ]
 
         env = self._augment_env_for_tools(os.environ.copy())
         env["LOGURU_LEVEL"] = "ERROR"
 
-        t = threading.Thread(target=self._runner, args=(cmd, env), daemon=True)
+        t = threading.Thread(target=self._runner_pipeline, args=([cmd_dyn, cmd_case], env), daemon=True)
         t.start()
 
     def _stop(self):
@@ -1387,33 +1411,47 @@ class CyberShadowHub(ctk.CTk):
             except Exception:
                 pass
 
-    def _runner(self, cmd, env):
+    def _runner_pipeline(self, cmds: List[List[str]], env: Dict[str, str]):
+        """
+        Run one or more commands sequentially, streaming output to UI.
+        """
         try:
-            self._q.put(f"[CMD] {self._fmt_cmd(cmd)}\n")
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-                env=env
-            )
-
-            assert self._proc.stdout is not None
-            for line in self._proc.stdout:
+            for idx, cmd in enumerate(cmds):
                 if self._stop_flag.is_set():
                     break
-                self._q.put(line)
-                self._parser.feed_line(line)
 
-            try:
-                rc = self._proc.wait(timeout=5)
-            except Exception:
-                rc = None
+                self._q.put(f"[CMD {idx+1}/{len(cmds)}] {self._fmt_cmd(cmd)}\n")
+                self._proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True,
+                    env=env
+                )
 
-            if rc is not None:
-                self._parser.summary.return_code = rc
+                assert self._proc.stdout is not None
+                for line in self._proc.stdout:
+                    if self._stop_flag.is_set():
+                        break
+                    self._q.put(line)
+                    self._parser.feed_line(line)
+
+                try:
+                    rc = self._proc.wait(timeout=5)
+                except Exception:
+                    rc = None
+
+                if rc is not None:
+                    self._parser.summary.return_code = rc
+
+                # separator between stages
+                self._q.put("\n")
+
+                if rc not in (0, None) and idx == 0:
+                    # if first command fails, stop pipeline
+                    break
 
         except FileNotFoundError as e:
             self._q.put(f"[ERROR] Command not found: {e}\n")
@@ -1480,7 +1518,8 @@ class CyberShadowHub(ctk.CTk):
         lines: List[str] = []
         if s.pipeline_kv:
             lines.append("== PIPELINE SUMMARY ==")
-            preferred = ["Case", "Risk mode", "Evidence", "APK", "Severity", "Score", "Artifact", "APK Report", "Case Report", "Ledger"]
+            preferred = ["Case", "Risk mode", "Evidence", "APK", "Severity", "Score",
+                         "Artifact", "APK Report", "Case Report", "Ledger"]
             used = set()
             for k in preferred:
                 if k in s.pipeline_kv:
@@ -1525,6 +1564,11 @@ class CyberShadowHub(ctk.CTk):
         if not os.path.isdir(rep_dir):
             return None
 
+        # Prefer case_report.html always (if exists)
+        cr = os.path.join(rep_dir, "case_report.html")
+        if os.path.exists(cr):
+            return cr
+
         name = os.path.basename(p)
         kind = self._artifact_kind_from_name(name)
 
@@ -1533,27 +1577,16 @@ class CyberShadowHub(ctk.CTk):
             candidate = os.path.join(rep_dir, f"apk_report__{stem}.html")
             if os.path.exists(candidate):
                 return candidate
-            cands = [os.path.join(rep_dir, x) for x in os.listdir(rep_dir) if x.startswith("apk_report__") and x.endswith(".html")]
-            cands.sort(key=lambda fp: os.path.getmtime(fp), reverse=True)
-            return cands[0] if cands else None
 
         if kind == "DYNAMIC":
-                stem = os.path.splitext(name)[0]
-                cand1 = os.path.join(rep_dir, f"apk_dynamic_report__{stem}.html")
-                if os.path.exists(cand1):
-                    return cand1
+            stem = os.path.splitext(name)[0]
+            cand1 = os.path.join(rep_dir, f"apk_dynamic_report__{stem}.html")
+            if os.path.exists(cand1):
+                return cand1
 
-                # fallback: case_report.html (dacă există)
-                candidate = os.path.join(rep_dir, "case_report.html")
-                if os.path.exists(candidate):
-                    return candidate
-
-                cands = [os.path.join(rep_dir, x) for x in os.listdir(rep_dir) if x.lower().endswith(".html")]
-                cands.sort(key=lambda fp: os.path.getmtime(fp), reverse=True)
-                return cands[0] if cands else None
-
-
-        return None
+        cands = [os.path.join(rep_dir, x) for x in os.listdir(rep_dir) if x.lower().endswith(".html")]
+        cands.sort(key=lambda fp: os.path.getmtime(fp), reverse=True)
+        return cands[0] if cands else None
 
     def _load_report_into_viewer(self):
         p = self._find_report_for_selected_artifact()
@@ -1598,7 +1631,8 @@ class CyberShadowHub(ctk.CTk):
             return
         try:
             import webbrowser
-            webbrowser.open(f"file:///{p.replace(os.sep, '/')}")
+            uri = Path(p).absolute().as_uri()  # safest on Windows (spaces etc)
+            webbrowser.open(uri)
         except Exception as e:
             messagebox.showerror("Open External Error", str(e))
 
@@ -1642,7 +1676,6 @@ class CyberShadowHub(ctk.CTk):
             pass
 
     def _set_summary_text(self, text: str):
-        # if UI isn't ready yet, store and render later
         if not hasattr(self, "summary_text"):
             self._pending_summary_text = text
             return
@@ -1701,15 +1734,6 @@ def inject_viewer_override_css(html: str) -> str:
     border: 1px solid rgba(255,255,255,0.10) !important;
     border-radius: 10px !important;
   }
-  .LOW { background: rgba(0,255,160,0.10) !important; color: rgba(140,255,210,0.95) !important; }
-  .MEDIUM { background: rgba(255,190,0,0.12) !important; color: rgba(255,210,110,0.95) !important; }
-  .HIGH { background: rgba(255,80,80,0.12) !important; color: rgba(255,170,170,0.95) !important; }
-  .CRITICAL { background: rgba(255,40,120,0.14) !important; color: rgba(255,170,210,0.95) !important; }
-  .UNKNOWN { background: rgba(255,255,255,0.06) !important; color: rgba(255,255,255,0.82) !important; }
-  .SCORE_GREEN { background: rgba(0,255,170,0.10) !important; border-color: rgba(0,255,170,0.22) !important; }
-  .SCORE_YELLOW { background: rgba(255,205,0,0.12) !important; border-color: rgba(255,205,0,0.22) !important; }
-  .SCORE_ORANGE { background: rgba(255,130,0,0.12) !important; border-color: rgba(255,130,0,0.22) !important; }
-  .SCORE_RED { background: rgba(255,60,60,0.12) !important; border-color: rgba(255,60,60,0.22) !important; }
 </style>
 """
     m = re.search(r"<head[^>]*>", html, flags=re.IGNORECASE)
