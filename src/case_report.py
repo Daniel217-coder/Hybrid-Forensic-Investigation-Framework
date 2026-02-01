@@ -1,3 +1,4 @@
+# src/case_report.py
 from __future__ import annotations
 
 import json
@@ -35,29 +36,38 @@ def _safe_int(x: Any, default: int = 0) -> int:
         return default
 
 
-def _clamp(x: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, int(x)))
+def _clamp(n: int, lo: int = 0, hi: int = 100) -> int:
+    try:
+        n = int(n)
+    except Exception:
+        n = 0
+    if n < lo:
+        return lo
+    if n > hi:
+        return hi
+    return n
 
 
-def _html_escape(s: Any) -> str:
+def _escape(s: Any) -> str:
+    # minimal HTML escape
     if s is None:
         return ""
+    s = str(s)
     return (
-        str(s)
-        .replace("&", "&amp;")
+        s.replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace('"', "&quot;")
-        .replace("'", "&#x27;")
+        .replace("'", "&#39;")
     )
 
 
-# --------------------------- UI scoring bands ---------------------------
+# --------------------------- scoring helpers ---------------------------
 
 def _score_band(score: int) -> str:
-    # Requested UI thresholds:
-    # green <20, yellow <50, orange <75, red >=75
-    s = _clamp(_safe_int(score, 0), 0, 100)
+    # UI thresholds requested:
+    # green <20, yellow <50, orange <75, red >=75 (<=100)
+    s = _safe_int(score, 0)
     if s < 20:
         return "SCORE_GREEN"
     if s < 50:
@@ -67,923 +77,754 @@ def _score_band(score: int) -> str:
     return "SCORE_RED"
 
 
-def _final_severity_from_score(score: int) -> str:
-    s = _clamp(_safe_int(score, 0), 0, 100)
-    if s >= 80:
-        return "CRITICAL"
-    if s >= 60:
-        return "HIGH"
-    if s >= 35:
-        return "MEDIUM"
-    return "LOW"
-
-
-def _dedupe_evidence(evidence: list[dict]) -> list[dict]:
-    seen = set()
-    out = []
-    for e in evidence or []:
-        key = (e.get("type", ""), e.get("name", ""), e.get("sha256", ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(e)
-    return out
-
-
 def sev_badge_class(sev: str) -> str:
-    s = (sev or "UNKNOWN").upper().strip()
-    if s not in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}:
-        return "UNKNOWN"
-    return s
+    sev_u = str(sev or "").upper().strip()
+    if sev_u in ("SAFE", "LOW"):
+        return "sev-low"
+    if sev_u in ("MEDIUM", "MODERATE"):
+        return "sev-med"
+    if sev_u in ("HIGH",):
+        return "sev-high"
+    if sev_u in ("CRITICAL",):
+        return "sev-crit"
+    return "sev-unk"
 
 
-# --------------------------- Report linking (polish) ---------------------------
-
-def _artifact_json_href(artifact_name: str) -> str:
-    # case_report.html is in cases/<CASE>/reports/
-    # artifacts live in ../artifacts/
-    return f"../artifacts/{artifact_name}"
-
-
-def _artifact_stem(artifact_name: str) -> str:
-    try:
-        return Path(artifact_name).stem
-    except Exception:
-        return artifact_name
-
-
-def _candidate_report_names(artifact_name: str) -> list[str]:
-    """
-    We support multiple historical report naming conventions.
-    Priority:
-      1) apk_report__<artifact_stem>.html         (new polished)
-      2) apk_dynamic_report__<artifact_stem>.html (older dynamic)
-      3) apk_static_report__<artifact_stem>.html  (older static)
-    """
-    stem = _artifact_stem(artifact_name)
-    return [
-        f"apk_report__{stem}.html",
-        f"apk_dynamic_report__{stem}.html",
-        f"apk_static_report__{stem}.html",
-    ]
-
-
-def _pick_existing_report_href(reports_dir: Path, artifact_name: str) -> str:
-    for name in _candidate_report_names(artifact_name):
-        if (reports_dir / name).exists():
-            return name
-    # default to the new name even if not generated yet (still useful)
-    return _candidate_report_names(artifact_name)[0]
-
-
-def _btn(href: str, label: str, kind: str = "primary") -> str:
-    if not href:
-        return ""
-    cls = "btn" if kind == "primary" else "btn ghost"
-    return f"<a class='{cls}' href='{_html_escape(href)}'>{_html_escape(label)}</a>"
-
-
-def _pill(label: str, value: str, extra_cls: str = "") -> str:
-    c = f"pill {extra_cls}".strip()
-    return f"<span class='{c}'><b>{_html_escape(label)}:</b> {_html_escape(value)}</span>"
-
-
-def _pill_bool(label: str, val: bool) -> str:
-    cls = "pill-ok" if bool(val) else "pill-no"
-    return f"<span class='pill {cls}'><b>{_html_escape(label)}:</b> {'YES' if bool(val) else 'NO'}</span>"
-
-
-# --------------------------- Artifact parsing ---------------------------
-
-def _pick_artifacts(artifacts_dir: Path, glob_pat: str) -> list[Path]:
-    files = sorted(list(artifacts_dir.glob(glob_pat)), key=lambda p: p.stat().st_mtime, reverse=True)
-    return files
-
-
-def _extract_static_fields(obj: dict) -> tuple[int, str, list[str]]:
-    scoring = obj.get("scoring", {}) or {}
-    score = _safe_int(scoring.get("score", 0), 0)
-    sev = str(scoring.get("severity", "") or "").upper().strip()
-    reasons = scoring.get("reasons", []) or []
-    if not sev:
-        sev = _final_severity_from_score(score)
-    return score, sev, [str(x) for x in reasons]
-
-
-def _extract_dyn_fields(obj: dict) -> tuple[int, str, list[str], bool, bool]:
-    scoring = obj.get("scoring", {}) or {}
-    score = _safe_int(scoring.get("score", 0), 0)
-    sev = str(scoring.get("severity", "") or "").upper().strip()
-    reasons = scoring.get("reasons", []) or []
-    if not sev:
-        sev = _final_severity_from_score(score)
-
-    malicious_unlock = bool(scoring.get("malicious_unlock", False))
-    benign_cap_applied = bool(scoring.get("benign_cap_applied", False))
-    return score, sev, [str(x) for x in reasons], malicious_unlock, benign_cap_applied
-
-
-def _normalize_static(artifacts: list[Path]) -> list[dict]:
-    out: list[dict] = []
-    for p in artifacts:
-        obj = _load_json(p)
-        score, sev, reasons = _extract_static_fields(obj)
-        out.append(
-            {
-                "artifact_name": p.name,
-                "artifact_mtime_utc": _fmt_fs_ts_mtime(p),
-                "score": _clamp(score, 0, 100),
-                "severity": _final_severity_from_score(score),
-                "engine_severity": sev,  # informational
-                "reasons": reasons[:60],
-                "app_name": obj.get("app_name", "") or obj.get("app", "") or "",
-                "package": obj.get("package", "") or "",
-                "version_name": obj.get("version_name", "") or "",
-                "version_code": obj.get("version_code", "") or "",
-                "kind": "apk_static",
-            }
-        )
+def _normalize_static(obj: dict, artifact_name: str, artifact_path: Path) -> dict:
+    scoring = (obj.get("scoring") or {})
+    out = {
+        "artifact_name": artifact_name,
+        "artifact_path": str(artifact_path),
+        "artifact_mtime_utc": _fmt_fs_ts_mtime(artifact_path),
+        "module": "apk_static",
+        "package": obj.get("package", ""),
+        "app_name": obj.get("app_name", obj.get("app", "")),
+        "severity": scoring.get("severity", "UNKNOWN"),
+        "score": _safe_int(scoring.get("score", 0), 0),
+        "reasons": scoring.get("reasons", []) or [],
+    }
     return out
 
 
-def _normalize_dynamic(artifacts: list[Path]) -> list[dict]:
-    out: list[dict] = []
-    for p in artifacts:
-        obj = _load_json(p)
-        score, sev, reasons, malicious_unlock, benign_cap_applied = _extract_dyn_fields(obj)
-
-        runtime = obj.get("runtime", {}) or {}
-        tag = obj.get("tag", "") or ""
-        device = obj.get("device", "") or ""
-        device_serial = ""
-        try:
-            device_serial = str(device).split()[0]
-        except Exception:
-            device_serial = ""
-
-        out.append(
-            {
-                "artifact_name": p.name,
-                "artifact_mtime_utc": _fmt_fs_ts_mtime(p),
-                "score": _clamp(score, 0, 100),
-                "severity": _final_severity_from_score(score),
-                "engine_score": score,      # informational
-                "engine_severity": sev,     # informational
-                "reasons": reasons[:80],
-                "malicious_unlock": bool(malicious_unlock),
-                "benign_cap_applied": bool(benign_cap_applied),
-                "tag": tag,
-                "device_serial": device_serial,
-                "app_name": obj.get("app_name", "") or "",
-                "package": obj.get("package", "") or "",
-                "kind": "apk_dynamic",
-                "runtime": {
-                    "endpoint": runtime.get("endpoint"),
-                    "gadget_ready": runtime.get("gadget_ready"),
-                    "frida_attach_error": runtime.get("frida_attach_error"),
-                    "event_counts": runtime.get("event_counts") or {},
-                    "key_counts": runtime.get("key_counts") or {},
-                    "unlock_triggers": runtime.get("unlock_triggers") or [],
-                },
-                "iocs_split": obj.get("iocs_split") or {},
-            }
-        )
+def _normalize_dynamic(obj: dict, artifact_name: str, artifact_path: Path) -> dict:
+    scoring = (obj.get("scoring") or {})
+    out = {
+        "artifact_name": artifact_name,
+        "artifact_path": str(artifact_path),
+        "artifact_mtime_utc": _fmt_fs_ts_mtime(artifact_path),
+        "module": "apk_dynamic",
+        "package": obj.get("package", ""),
+        "app_name": obj.get("app_name", obj.get("app", "")),
+        "device": obj.get("device", {}),
+        "severity": scoring.get("severity", "UNKNOWN"),
+        "score": _safe_int(scoring.get("score", 0), 0),
+        "reasons": scoring.get("reasons", []) or [],
+        "events": obj.get("events", {}) or {},
+        "iocs": obj.get("iocs", {}) or {},
+    }
     return out
 
 
-def _mean_int(values: list[int]) -> int:
-    v = [int(x) for x in values if x is not None]
-    if not v:
+def _normalize_yara(obj: dict, artifact_name: str, artifact_path: Path) -> dict:
+    scoring = (obj.get("scoring") or {})
+    matches = obj.get("matches", obj.get("results", obj.get("rules", [])))
+    out = {
+        "artifact_name": artifact_name,
+        "artifact_path": str(artifact_path),
+        "artifact_mtime_utc": _fmt_fs_ts_mtime(artifact_path),
+        "module": "yara",
+        "apk_name": obj.get("apk_name", obj.get("apk", "")),
+        "severity": scoring.get("severity", "UNKNOWN"),
+        "score": _safe_int(scoring.get("score", 0), 0),
+        "reasons": scoring.get("reasons", []) or [],
+        "matches": matches,
+        "malicious_unlock": bool(scoring.get("malicious_unlock", obj.get("malicious_unlock", False))),
+    }
+    return out
+
+
+def _normalize_yara_matches(matches) -> list[dict]:
+    """Coerce YARA match output into list[dict] so templates can slice safely.
+
+    Accepts:
+      - list[dict] (preferred)
+      - list[str]
+      - dict with a 'matches' / 'rules' / 'results' list
+      - dict mapping rule_name -> meta
+    """
+    if not matches:
+        return []
+    if isinstance(matches, list):
+        out: list[dict] = []
+        for m in matches:
+            if isinstance(m, dict):
+                out.append(m)
+            else:
+                out.append({"rule": str(m)})
+        return out
+    if isinstance(matches, dict):
+        for key in ("matches", "rules", "results"):
+            v = matches.get(key)
+            if isinstance(v, list):
+                return _normalize_yara_matches(v)
+        out: list[dict] = []
+        for k, v in matches.items():
+            if isinstance(v, dict):
+                d = dict(v)
+                d.setdefault("rule", str(k))
+                out.append(d)
+            else:
+                out.append({"rule": str(k), "value": v})
+        return out
+    return []
+
+
+def _normalize_memlite(obj: dict, artifact_name: str, artifact_path: Path) -> dict:
+    scoring = (obj.get("scoring") or {})
+    out = {
+        "artifact_name": artifact_name,
+        "artifact_path": str(artifact_path),
+        "artifact_mtime_utc": _fmt_fs_ts_mtime(artifact_path),
+        "module": "memlite",
+        "package": obj.get("package", ""),
+        "device": obj.get("device", {}),
+        "severity": scoring.get("severity", "UNKNOWN"),
+        "score": _safe_int(scoring.get("score", 0), 0),
+        "reasons": scoring.get("reasons", []) or [],
+        "extras": obj.get("extras", {}) or {},
+    }
+    return out
+
+
+def _latest_by_mtime(items: list[dict]) -> dict | None:
+    if not items:
+        return None
+    return sorted(items, key=lambda x: str(x.get("artifact_mtime_utc", "")), reverse=True)[0]
+
+
+def _max_by_score(items: list[dict]) -> dict | None:
+    if not items:
+        return None
+    return sorted(items, key=lambda x: _safe_int(x.get("score", 0), 0), reverse=True)[0]
+
+
+def _mean_score(items: list[dict]) -> int:
+    if not items:
         return 0
-    return int(round(sum(v) / float(len(v))))
+    vals = [_safe_int(x.get("score", 0), 0) for x in items]
+    if not vals:
+        return 0
+    return int(round(sum(vals) / len(vals)))
 
 
-def _case_malicious_unlock(apk_static: list[dict], apk_dynamic: list[dict]) -> bool:
-    # If ANY dynamic artifact is unlocked -> allow high scoring
-    for d in apk_dynamic or []:
-        if bool(d.get("malicious_unlock", False)):
-            return True
-
-    # Optional: if static has explicit high-risk reasons (keywords), unlock too
-    # (kept conservative; tweak later)
-    for s in apk_static or []:
-        rs = " ".join([str(x) for x in (s.get("reasons") or [])]).lower()
-        if any(k in rs for k in ["accessibility", "device admin", "read_sms", "send_sms", "banking trojan", "dropper"]):
-            return True
-
-    return False
+def _pick_mode(items: list[dict], mode: RiskMode) -> dict | None:
+    if mode == "latest":
+        return _latest_by_mtime(items)
+    if mode == "max":
+        return _max_by_score(items)
+    # mean returns synthetic
+    return None
 
 
-def build_case_summary(case_dir: str, risk_mode: RiskMode = "latest") -> dict:
-    case_path = Path(case_dir)
-    case = _load_json(case_path / "case.json")
-    artifacts_dir = case_path / "artifacts"
+def _severity_from_score(score: int) -> str:
+    s = _safe_int(score, 0)
+    if s < 20:
+        return "LOW"
+    if s < 50:
+        return "MEDIUM"
+    if s < 75:
+        return "HIGH"
+    return "CRITICAL"
 
-    static_paths = _pick_artifacts(artifacts_dir, "apk_static__*.json")
-    dynamic_paths = _pick_artifacts(artifacts_dir, "apk_dynamic__*.json")
 
-    apk_static = _normalize_static(static_paths)
-    apk_dynamic = _normalize_dynamic(dynamic_paths)
+# --------------------------- case aggregation ---------------------------
 
-    # build “scored items” list to support latest/max
-    scored_items = []
-    for row in apk_static + apk_dynamic:
+def _collect_artifacts(case_dir: Path) -> dict:
+    artifacts_dir = case_dir / "artifacts"
+    out = {"static": [], "dynamic": [], "yara": [], "memlite": []}
+    if not artifacts_dir.exists():
+        return out
+
+    for p in sorted(artifacts_dir.glob("*.json")):
+        name = p.name
         try:
-            mtime = (artifacts_dir / row["artifact_name"]).stat().st_mtime
+            obj = _load_json(p)
         except Exception:
-            mtime = 0.0
-        scored_items.append((mtime, int(row.get("score", 0)), row.get("artifact_name", ""), row.get("kind", "")))
+            continue
 
-    scored_items.sort(key=lambda t: t[0], reverse=True)
-    scores = [int(s) for (_mt, s, _a, _k) in scored_items]
+        if name.startswith("apk_static__"):
+            out["static"].append(_normalize_static(obj, name, p))
+        elif name.startswith("apk_dynamic__"):
+            out["dynamic"].append(_normalize_dynamic(obj, name, p))
+        elif name.startswith("yara__"):
+            out["yara"].append(_normalize_yara(obj, name, p))
+        elif name.startswith("memlite__"):
+            out["memlite"].append(_normalize_memlite(obj, name, p))
 
-    latest_score = scores[0] if scores else 0
-    latest_artifact = scored_items[0][2] if scored_items else ""
-    latest_kind = scored_items[0][3] if scored_items else ""
+    return out
 
-    # per-module latest
-    latest_static_score = _safe_int(apk_static[0]["score"], 0) if apk_static else 0
-    latest_dynamic_score = _safe_int(apk_dynamic[0]["score"], 0) if apk_dynamic else 0
 
-    rm = (risk_mode or "latest").lower().strip()
-    if rm == "max":
-        final_score = max(scores) if scores else 0
-        risk_note = "worst-case across all artifacts"
-    elif rm == "mean":
-        # mean of the most recent module outputs (stable for dashboard)
-        bucket = []
-        if apk_static:
-            bucket.append(_clamp(latest_static_score, 0, 100))
-        if apk_dynamic:
-            bucket.append(_clamp(latest_dynamic_score, 0, 100))
-        final_score = _mean_int(bucket) if bucket else 0
-        risk_note = "mean of latest static + latest dynamic"
-    else:
-        final_score = latest_score if scores else 0
-        risk_note = "verdict from most recent artifact"
-
-    final_score = _clamp(final_score, 0, 100)
-
-    # benign-aware cap (GOLD RULE): benign apps must be < 20
-    malicious_unlock = _case_malicious_unlock(apk_static, apk_dynamic)
-    benign_cap_applied = False
-    if not malicious_unlock and final_score >= 20:
-        final_score = 19
-        benign_cap_applied = True
-
-    final_sev = _final_severity_from_score(final_score)
-    evidence = _dedupe_evidence(case.get("evidence", []) or [])
-
-    modules_present = []
-    if apk_static:
-        modules_present.append("apk_static")
-    if apk_dynamic:
-        modules_present.append("apk_dynamic")
-
+def _case_meta(case_dir: Path) -> dict:
+    case_json = case_dir / "case.json"
+    if not case_json.exists():
+        return {"id": case_dir.name, "created_at": "unknown"}
+    try:
+        cj = _load_json(case_json)
+    except Exception:
+        cj = {}
     return {
-        "case_id": case.get("case_id", "UNKNOWN"),
-        "created_at_utc": _fmt_ts(case.get("created_at", 0)),
-        "env": case.get("env", {}) or {},
-        "evidence": evidence,
-        "apk_static": apk_static,
-        "apk_dynamic": apk_dynamic,
-        "modules_present": modules_present,
-        "risk": {
-            "risk_mode": rm,
-            "risk_note": risk_note,
-            "score": int(final_score),
-            "severity": final_sev,
-            "latest_artifact": latest_artifact,
-            "latest_kind": latest_kind,
-            "latest_static_score": int(_clamp(latest_static_score, 0, 100)),
-            "latest_dynamic_score": int(_clamp(latest_dynamic_score, 0, 100)),
-            "malicious_unlock": bool(malicious_unlock),
-            "benign_cap_applied": bool(benign_cap_applied),
-        },
+        "id": cj.get("id", case_dir.name),
+        "created_at": cj.get("created_at", cj.get("created", "unknown")),
+        "base_dir": str(case_dir),
     }
 
 
+def _benign_cap_applies(static_score: int, dyn_score: int, yara_unlock: bool) -> bool:
+    # If neither static nor dynamic show high-confidence malware,
+    # and we don't have a high-confidence YARA unlock, cap verdict to avoid false positives.
+    base = max(_safe_int(static_score, 0), _safe_int(dyn_score, 0))
+    if yara_unlock:
+        return False
+    return base < 20
+
+
+def _aggregate_case_score(static_score: int, dyn_score: int, yara_score: int, mem_score: int, yara_unlock: bool) -> dict:
+    # Primary signals
+    base = max(_safe_int(static_score, 0), _safe_int(dyn_score, 0))
+
+    # Extras are intentionally capped to avoid benign -> malware inflation
+    mem_cap = 10
+    yara_low_cap = 10
+
+    mem_contrib = min(_safe_int(mem_score, 0), mem_cap)
+
+    if yara_unlock:
+        yara_contrib = _safe_int(yara_score, 0)
+        bonus = 5
+        reasons = [
+            f"Static/Dynamic base: {base}",
+            f"MemLite contributes {mem_contrib} (cap {mem_cap})",
+            f"YARA contributes {yara_contrib} (high-confidence unlock)",
+            f"YARA unlock bonus (+{bonus})",
+        ]
+        total = base + mem_contrib + yara_contrib + bonus
+    else:
+        yara_contrib = min(_safe_int(yara_score, 0), yara_low_cap)
+        reasons = [
+            f"Static/Dynamic base: {base}",
+            f"MemLite contributes {mem_contrib} (cap {mem_cap})",
+            f"YARA contributes {yara_contrib} (low-confidence cap {yara_low_cap})",
+        ]
+        total = base + mem_contrib + yara_contrib
+
+    total = _clamp(total, 0, 100)
+
+    if _benign_cap_applies(static_score, dyn_score, yara_unlock):
+        # hard cap (benign-aware)
+        total = min(total, 19)
+        reasons.append("Benign-aware cap applied (no high-confidence indicators) → score capped at 19/100.")
+
+    sev = _severity_from_score(total)
+    return {"score": total, "severity": sev, "reasons": reasons}
+
+
+# --------------------------- HTML template ---------------------------
+
+CSS = r"""
+:root{
+  --bg:#0a0f1e;
+  --panel:#0e162b;
+  --panel2:#101b34;
+  --text:#e8efff;
+  --muted:#aab6d7;
+  --line:#203055;
+  --green:#2ecc71;
+  --yellow:#f1c40f;
+  --orange:#e67e22;
+  --red:#e74c3c;
+  --blue:#4aa3ff;
+  --pill:#1a2a4f;
+  --shadow:rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+body{
+  margin:0;
+  font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;
+  color:var(--text);
+  background: radial-gradient(1200px 600px at 40% -10%, rgba(74,163,255,.25), transparent),
+              radial-gradient(900px 500px at 90% 10%, rgba(46,204,113,.15), transparent),
+              var(--bg);
+}
+a{color:var(--blue); text-decoration:none}
+a:hover{text-decoration:underline}
+.container{max-width:1200px; margin:22px auto; padding:0 18px}
+.header{
+  background: linear-gradient(180deg, rgba(16,27,52,.95), rgba(14,22,43,.92));
+  border:1px solid var(--line);
+  border-radius:16px;
+  box-shadow:0 14px 40px var(--shadow);
+  padding:18px 18px 12px;
+}
+.h1{display:flex; align-items:center; justify-content:space-between; gap:16px}
+.h1 h1{margin:0; font-size:22px; letter-spacing:.2px}
+.h1 .meta{display:flex; gap:10px; flex-wrap:wrap; justify-content:flex-end}
+.pill{
+  background:rgba(26,42,79,.75);
+  border:1px solid rgba(32,48,85,.9);
+  color:var(--text);
+  padding:7px 10px;
+  border-radius:999px;
+  font-size:12px;
+  display:inline-flex; align-items:center; gap:8px;
+}
+.pill b{font-weight:700}
+.grid{
+  margin-top:16px;
+  display:grid;
+  grid-template-columns: 1.2fr .8fr;
+  gap:14px;
+}
+.card{
+  background: linear-gradient(180deg, rgba(16,27,52,.92), rgba(14,22,43,.90));
+  border:1px solid var(--line);
+  border-radius:16px;
+  box-shadow:0 12px 36px var(--shadow);
+  overflow:hidden;
+}
+.card h2{
+  margin:0;
+  font-size:14px;
+  color:var(--muted);
+  letter-spacing:.4px;
+  text-transform:uppercase;
+  padding:14px 14px 10px;
+  border-bottom:1px solid rgba(32,48,85,.65);
+}
+.card .body{padding:14px}
+.badge{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  padding:6px 10px;
+  border-radius:999px;
+  font-size:12px;
+  border:1px solid rgba(255,255,255,.12);
+}
+.badge.sev{font-weight:700}
+.sev-low{background:rgba(46,204,113,.12); border-color:rgba(46,204,113,.35); color:var(--green)}
+.sev-med{background:rgba(241,196,15,.12); border-color:rgba(241,196,15,.35); color:var(--yellow)}
+.sev-high{background:rgba(230,126,34,.12); border-color:rgba(230,126,34,.35); color:var(--orange)}
+.sev-crit{background:rgba(231,76,60,.12); border-color:rgba(231,76,60,.35); color:var(--red)}
+.sev-unk{background:rgba(170,182,215,.10); border-color:rgba(170,182,215,.25); color:var(--muted)}
+.badge.score{font-weight:800}
+.SCORE_GREEN{background:rgba(46,204,113,.12); border-color:rgba(46,204,113,.35)}
+.SCORE_YELLOW{background:rgba(241,196,15,.12); border-color:rgba(241,196,15,.35)}
+.SCORE_ORANGE{background:rgba(230,126,34,.12); border-color:rgba(230,126,34,.35)}
+.SCORE_RED{background:rgba(231,76,60,.12); border-color:rgba(231,76,60,.35)}
+.table{
+  width:100%;
+  border-collapse:collapse;
+  font-size:13px;
+}
+.table th, .table td{
+  padding:10px 10px;
+  border-bottom:1px solid rgba(32,48,85,.55);
+  vertical-align:top;
+}
+.table th{color:var(--muted); font-weight:700; text-transform:uppercase; font-size:11px; letter-spacing:.35px}
+.table tr:hover td{background:rgba(26,42,79,.25)}
+.small{font-size:12px; color:var(--muted)}
+.muted{color:var(--muted)}
+.mono{font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,monospace; font-size:12px}
+.section{margin-top:14px}
+.compact{margin:8px 0 0; padding-left:18px}
+.compact li{margin:2px 0}
+.tabs{
+  display:flex; gap:8px; flex-wrap:wrap;
+  padding:12px 14px 0;
+}
+.tab{
+  background: rgba(26,42,79,.45);
+  border:1px solid rgba(32,48,85,.7);
+  color:var(--text);
+  padding:8px 10px;
+  border-radius:12px 12px 0 0;
+  font-size:12px;
+  cursor:pointer;
+  user-select:none;
+}
+.tab.active{
+  background: rgba(74,163,255,.18);
+  border-color: rgba(74,163,255,.55);
+}
+.tabpanels{
+  padding:0 14px 14px;
+}
+.panel{display:none}
+.panel.active{display:block}
+.why-card{
+  background: rgba(16,27,52,.55);
+  border:1px solid rgba(32,48,85,.55);
+  border-radius:14px;
+  padding:12px;
+  margin:10px 0;
+}
+.why-title{font-weight:800; margin-bottom:6px}
+.why-meta{display:flex; gap:8px; flex-wrap:wrap; margin:6px 0 4px}
+.footer{
+  margin:18px 0 0;
+  color:var(--muted);
+  font-size:12px;
+  text-align:center;
+}
+@media (max-width: 980px){
+  .grid{grid-template-columns:1fr}
+}
+"""
+
+
+def _tab_script() -> str:
+    return r"""
+<script>
+(function(){
+  function $(sel){ return document.querySelector(sel); }
+  function $all(sel){ return Array.from(document.querySelectorAll(sel)); }
+
+  $all("[data-tab]").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      var group = btn.getAttribute("data-group");
+      var target = btn.getAttribute("data-tab");
+
+      $all('[data-group="'+group+'"][data-tab]').forEach(function(b){ b.classList.remove("active"); });
+      btn.classList.add("active");
+
+      $all('[data-panel="'+group+'"]').forEach(function(p){ p.classList.remove("active"); });
+      var panel = document.getElementById(target);
+      if(panel) panel.classList.add("active");
+    });
+  });
+})();
+</script>
+"""
+
+
+def _html_page(title: str, body: str) -> str:
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{_escape(title)}</title>
+<style>{CSS}</style>
+</head>
+<body>
+{body}
+{_tab_script()}
+</body>
+</html>
+"""
+
+
+# --------------------------- report builder ---------------------------
+
 def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
-    """
-    Generates a case-level HTML report.
-    - Always writes cases/<CASE>/reports/case_report.html (for convenience)
-    - Also writes cases/<CASE>/reports/case_report__<risk_mode>.html (so you can compare latest/max/mean)
-    """
-    summary = build_case_summary(case_dir, risk_mode=risk_mode)
-
     case_path = Path(case_dir)
-    reports_dir = case_path / "reports"
+    meta = _case_meta(case_path)
+    artifacts = _collect_artifacts(case_path)
 
-    score = int(summary["risk"]["score"])
-    sev = str(summary["risk"]["severity"])
-    rm = str(summary["risk"]["risk_mode"])
-    latest_art = str(summary["risk"]["latest_artifact"] or "")
-    latest_kind = str(summary["risk"]["latest_kind"] or "")
-    score_band = _score_band(score)
+    # Choose per-mode representative artifacts (or synth)
+    static_pick = _pick_mode(artifacts["static"], risk_mode)
+    dyn_pick = _pick_mode(artifacts["dynamic"], risk_mode)
+    yara_pick = _pick_mode(artifacts["yara"], risk_mode)
+    mem_pick = _pick_mode(artifacts["memlite"], risk_mode)
 
-    benign_cap = bool(summary["risk"].get("benign_cap_applied", False))
-    unlock = bool(summary["risk"].get("malicious_unlock", False))
+    static_score = _safe_int((static_pick or {}).get("score", 0), 0) if risk_mode != "mean" else _mean_score(artifacts["static"])
+    dyn_score = _safe_int((dyn_pick or {}).get("score", 0), 0) if risk_mode != "mean" else _mean_score(artifacts["dynamic"])
+    yara_score = _safe_int((yara_pick or {}).get("score", 0), 0) if risk_mode != "mean" else _mean_score(artifacts["yara"])
+    mem_score = _safe_int((mem_pick or {}).get("score", 0), 0) if risk_mode != "mean" else _mean_score(artifacts["memlite"])
 
-    # Quick links (latest)
-    latest_report_href = _pick_existing_report_href(reports_dir, latest_art) if latest_art else ""
-    latest_json_href = _artifact_json_href(latest_art) if latest_art else ""
+    # High-confidence unlock only if explicitly set by YARA scoring
+    yara_unlock = bool((yara_pick or {}).get("malicious_unlock", False))
+    agg = _aggregate_case_score(static_score, dyn_score, yara_score, mem_score, yara_unlock=yara_unlock)
 
-    # Evidence table
-    evidence_rows = ""
-    for e in summary.get("evidence", []) or []:
-        evidence_rows += (
+    final_score = _safe_int(agg.get("score", 0), 0)
+    final_sev = agg.get("severity", "UNKNOWN")
+    final_band = _score_band(final_score)
+
+    # summary object for HTML (keeps lists for tables)
+    summary = {
+        "static": artifacts["static"],
+        "dynamic": artifacts["dynamic"],
+        "yara": artifacts["yara"],
+        "memlite": artifacts["memlite"],
+        "picked": {
+            "static": static_pick,
+            "dynamic": dyn_pick,
+            "yara": yara_pick,
+            "memlite": mem_pick,
+        },
+        "final": {
+            "score": final_score,
+            "severity": final_sev,
+            "reasons": agg.get("reasons", []) or [],
+            "yara_unlock": yara_unlock,
+        },
+    }
+
+    # render sections
+    header = f"""
+<div class="container">
+  <div class="header">
+    <div class="h1">
+      <h1>CYBERSHADOW • Case Report</h1>
+      <div class="meta">
+        <span class="pill">Case: <b>{_escape(meta.get("id",""))}</b></span>
+        <span class="pill">Created: <span class="mono">{_escape(meta.get("created_at",""))}</span></span>
+        <span class="pill"><span class="badge sev {sev_badge_class(final_sev)}">{_escape(final_sev)}</span></span>
+        <span class="pill"><span class="badge score {final_band}">Final Score: <b>{final_score}</b>/100</span></span>
+        <span class="pill">Risk mode: <b>{_escape(risk_mode)}</b></span>
+        <span class="pill">Malicious unlock: <b>{"YES" if yara_unlock else "NO"}</b></span>
+      </div>
+    </div>
+    <div class="tabs">
+      <div class="tab active" data-group="main" data-tab="panel_overview">Overview</div>
+      <div class="tab" data-group="main" data-tab="panel_static">Static</div>
+      <div class="tab" data-group="main" data-tab="panel_dynamic">Dynamic</div>
+      <div class="tab" data-group="main" data-tab="panel_yara">YARA</div>
+      <div class="tab" data-group="main" data-tab="panel_memlite">MemLite</div>
+      <div class="tab" data-group="main" data-tab="panel_top">Top / Why</div>
+    </div>
+  </div>
+"""
+
+    # --- Overview panel ---
+    final_reasons = summary["final"]["reasons"]
+    reasons_html = "<ul class='compact'>" + "".join(f"<li>{_escape(r)}</li>" for r in final_reasons) + "</ul>"
+
+    overview = f"""
+  <div class="grid tabpanels">
+    <div class="card panel active" id="panel_overview" data-panel="main">
+      <h2>Final verdict</h2>
+      <div class="body">
+        <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px">
+          <span class="badge sev {sev_badge_class(final_sev)}">{_escape(final_sev)}</span>
+          <span class="badge score {final_band}">Score: <b>{final_score}</b>/100</span>
+          <span class="pill">Static: <b class="mono">{static_score}</b></span>
+          <span class="pill">Dynamic: <b class="mono">{dyn_score}</b></span>
+          <span class="pill">YARA: <b class="mono">{yara_score}</b></span>
+          <span class="pill">MemLite: <b class="mono">{mem_score}</b></span>
+        </div>
+        <div class="small muted">Static/Dynamic are the primary risk signals. YARA + MemLite are capped “extras” unless a high-confidence YARA unlock is present.</div>
+        <div class="section">{reasons_html}</div>
+      </div>
+    </div>
+
+    <div class="card panel active" id="panel_overview_side" data-panel="main" style="display:none"></div>
+  </div>
+"""
+
+    # --- Static panel ---
+    static_rows = ""
+    for s in summary.get("static", []) or []:
+        sev = s.get("severity", "UNKNOWN")
+        score = _safe_int(s.get("score", 0), 0)
+        band = _score_band(score)
+        static_rows += (
             "<tr>"
-            f"<td>{_html_escape(e.get('name',''))}</td>"
-            f"<td><span class='pill'><b>Type:</b> {_html_escape(e.get('type',''))}</span></td>"
-            f"<td class='mono'>{_html_escape(e.get('sha256',''))}</td>"
+            f"<td><code>{_escape(s.get('artifact_name',''))}</code><div class='muted small'>{_escape(s.get('artifact_mtime_utc',''))}</div></td>"
+            f"<td><span class='badge sev {sev_badge_class(sev)}'>{_escape(sev)}</span></td>"
+            f"<td><span class='badge score {band}'>Score: <b>{score}</b>/100</span></td>"
+            f"<td class='small'>{_escape(s.get('package',''))}<div class='muted'>{_escape(s.get('app_name',''))}</div></td>"
             "</tr>"
         )
-    if not evidence_rows:
-        evidence_rows = "<tr><td colspan='3'><i>No evidence added yet.</i></td></tr>"
+    if not static_rows:
+        static_rows = "<tr><td colspan='4' class='muted'>No static artifacts found.</td></tr>"
 
-    # Static rows + why
-    static_rows = ""
-    static_why = ""
-    for m in summary.get("apk_static", []) or []:
+    static_panel = f"""
+  <div class="card panel" id="panel_static" data-panel="main">
+    <h2>Static artifacts</h2>
+    <div class="body">
+      <table class="table">
+        <thead><tr><th>Artifact</th><th>Severity</th><th>Score</th><th>Package/App</th></tr></thead>
+        <tbody>{static_rows}</tbody>
+      </table>
+    </div>
+  </div>
+"""
+
+    # --- Dynamic panel ---
+    dyn_rows = ""
+    for d in summary.get("dynamic", []) or []:
+        sev = d.get("severity", "UNKNOWN")
+        score = _safe_int(d.get("score", 0), 0)
+        band = _score_band(score)
+
+        events = d.get("events", {}) or {}
+        hook = _safe_int(events.get("HOOK", 0), 0)
+        native = _safe_int(events.get("NATIVE", 0), 0)
+        ready = _safe_int(events.get("READY", 0), 0)
+
+        dyn_rows += (
+            "<tr>"
+            f"<td><code>{_escape(d.get('artifact_name',''))}</code><div class='muted small'>{_escape(d.get('artifact_mtime_utc',''))}</div></td>"
+            f"<td><span class='badge sev {sev_badge_class(sev)}'>{_escape(sev)}</span></td>"
+            f"<td><span class='badge score {band}'>Score: <b>{score}</b>/100</span></td>"
+            f"<td class='mono'>HOOK {hook} • NATIVE {native} • READY {ready}</td>"
+            "</tr>"
+        )
+    if not dyn_rows:
+        dyn_rows = "<tr><td colspan='4' class='muted'>No dynamic artifacts found.</td></tr>"
+
+    dyn_panel = f"""
+  <div class="card panel" id="panel_dynamic" data-panel="main">
+    <h2>Dynamic artifacts</h2>
+    <div class="body">
+      <table class="table">
+        <thead><tr><th>Artifact</th><th>Severity</th><th>Score</th><th>Events</th></tr></thead>
+        <tbody>{dyn_rows}</tbody>
+      </table>
+    </div>
+  </div>
+"""
+
+    # --- YARA panel ---
+    yara_rows = ""
+    yara_why = ""
+    for y in summary.get("yara", []) or []:
+        sev_y = y.get("severity", "UNKNOWN")
+        score_y = _safe_int(y.get("score", 0), 0)
+        band_y = _score_band(score_y)
+
+        matches_list = _normalize_yara_matches(y.get("matches", None))
+        mcount = len(matches_list)
+
+        top_rules = ", ".join(
+            [
+                str(m.get("rule") or "")
+                for m in matches_list[:6]
+                if isinstance(m, dict) and (m.get("rule") or "")
+            ]
+        )
+        top_rules = top_rules if top_rules else "(no rules listed)"
+
+        reasons = (y.get("reasons", []) or [])
+        reasons_html = "<ul class='compact'>" + "".join(f"<li>{_escape(r)}</li>" for r in reasons) + "</ul>"
+
+        yara_rows += (
+            "<tr>"
+            f"<td><code>{_escape(y.get('artifact_name',''))}</code><div class='muted small'>{_escape(y.get('artifact_mtime_utc',''))}</div></td>"
+            f"<td><span class='badge sev {sev_badge_class(sev_y)}'>{_escape(sev_y)}</span></td>"
+            f"<td><span class='badge score {band_y}'>Score: <b>{score_y}</b>/100</span></td>"
+            f"<td class='mono'>{mcount}</td>"
+            f"<td class='small'><span class='muted'>Top:</span> {_escape(top_rules)}</td>"
+            "</tr>"
+        )
+
+        yara_why += (
+            "<div class='why-card'>"
+            f"<div class='why-title'>YARA scan <span class='muted'>({_escape(y.get('apk_name',''))})</span></div>"
+            f"<div class='why-meta'>"
+            f"<span class='badge sev {sev_badge_class(sev_y)}'>{_escape(sev_y)}</span>"
+            f"<span class='badge score {band_y}'>Score: <b>{score_y}</b>/100</span>"
+            f"<span class='pill'>Matches: <span class='mono'>{mcount}</span></span>"
+            f"<span class='pill'>Artifact: <code>{_escape(y.get('artifact_name',''))}</code></span>"
+            f"</div>"
+            f"{reasons_html}"
+            "</div>"
+        )
+
+    if not yara_rows:
+        yara_rows = "<tr><td colspan='5' class='muted'>No YARA artifacts found.</td></tr>"
+
+    yara_panel = f"""
+  <div class="card panel" id="panel_yara" data-panel="main">
+    <h2>YARA artifacts</h2>
+    <div class="body">
+      <table class="table">
+        <thead><tr><th>Artifact</th><th>Severity</th><th>Score</th><th>Matches</th><th>Top rules</th></tr></thead>
+        <tbody>{yara_rows}</tbody>
+      </table>
+      <div class="section">{yara_why}</div>
+    </div>
+  </div>
+"""
+
+    # --- MemLite panel ---
+    mem_rows = ""
+    mem_why = ""
+    for m in summary.get("memlite", []) or []:
         sev_m = m.get("severity", "UNKNOWN")
         score_m = _safe_int(m.get("score", 0), 0)
         band_m = _score_band(score_m)
 
         reasons = (m.get("reasons", []) or [])
-        reasons_html = "<ul class='compact'>" + "".join(f"<li>{_html_escape(r)}</li>" for r in reasons) + "</ul>"
+        reasons_html = "<ul class='compact'>" + "".join(f"<li>{_escape(r)}</li>" for r in reasons) + "</ul>"
 
-        engine_sev = m.get("engine_severity", None)
-        ref_note = ""
-        if engine_sev and engine_sev != sev_m:
-            ref_note = (
-                "<div class='small muted'>"
-                f"Engine severity (ref): <b>{_html_escape(engine_sev)}</b> • Derived severity (used): <b>{_html_escape(sev_m)}</b>"
-                "</div>"
-            )
-
-        art_name = str(m.get("artifact_name", ""))
-        report_href = _pick_existing_report_href(reports_dir, art_name) if art_name else ""
-        json_href = _artifact_json_href(art_name) if art_name else ""
-
-        static_rows += (
+        mem_rows += (
             "<tr>"
-            f"<td>{_html_escape(m.get('app_name',''))}</td>"
-            f"<td><code>{_html_escape(m.get('package',''))}</code></td>"
-            f"<td>{_html_escape(m.get('version_name',''))} ({_html_escape(m.get('version_code',''))})</td>"
-            f"<td><span class='badge sev {sev_badge_class(sev_m)}'>{_html_escape(sev_m)}</span></td>"
-            f"<td><span class='badge score {band_m}'>Score: <b>{_html_escape(score_m)}</b>/100</span></td>"
-            f"<td class='small'><code>{_html_escape(art_name)}</code><div class='muted small'>{_html_escape(m.get('artifact_mtime_utc',''))}</div></td>"
-            f"<td class='actions-td'>{_btn(report_href, 'Open Report', 'primary')}</td>"
-            f"<td class='actions-td'>{_btn(json_href, 'Open JSON', 'secondary')}</td>"
+            f"<td><code>{_escape(m.get('artifact_name',''))}</code><div class='muted small'>{_escape(m.get('artifact_mtime_utc',''))}</div></td>"
+            f"<td><span class='badge sev {sev_badge_class(sev_m)}'>{_escape(sev_m)}</span></td>"
+            f"<td><span class='badge score {band_m}'>Score: <b>{score_m}</b>/100</span></td>"
+            f"<td class='small'>{_escape(m.get('package',''))}</td>"
             "</tr>"
         )
 
-        static_why += (
+        mem_why += (
             "<div class='why-card'>"
-            f"<div class='why-title'>{_html_escape(m.get('app_name',''))} <span class='muted'>({_html_escape(m.get('package',''))})</span></div>"
+            f"<div class='why-title'>MemLite snapshot <span class='muted'>({_escape(m.get('package',''))})</span></div>"
             f"<div class='why-meta'>"
-            f"<span class='badge sev {sev_badge_class(sev_m)}'>{_html_escape(sev_m)}</span>"
-            f"<span class='badge score {band_m}'>Score: <b>{_html_escape(score_m)}</b>/100</span>"
-            f"<span class='pill'>Artifact: <code>{_html_escape(art_name)}</code></span>"
-            f"<span class='pill'>Run: <span class='mono'>{_html_escape(m.get('artifact_mtime_utc',''))}</span></span>"
+            f"<span class='badge sev {sev_badge_class(sev_m)}'>{_escape(sev_m)}</span>"
+            f"<span class='badge score {band_m}'>Score: <b>{score_m}</b>/100</span>"
+            f"<span class='pill'>Artifact: <code>{_escape(m.get('artifact_name',''))}</code></span>"
             f"</div>"
-            f"<div class='why-actions'>{_btn(report_href, 'Open Report')}{_btn(json_href, 'Open JSON', 'secondary')}</div>"
-            f"{ref_note}"
             f"{reasons_html}"
             "</div>"
         )
 
-    if not static_rows:
-        static_rows = "<tr><td colspan='8'><i>No APK static artifacts found.</i></td></tr>"
-    if not static_why:
-        static_why = "<i>No static scoring reasons available.</i>"
+    if not mem_rows:
+        mem_rows = "<tr><td colspan='4' class='muted'>No MemLite artifacts found.</td></tr>"
 
-    # Dynamic rows + why
-    dyn_rows = ""
-    dyn_why = ""
-    for d in summary.get("apk_dynamic", []) or []:
-        sev_d = d.get("severity", "UNKNOWN")
-        score_d = _safe_int(d.get("score", 0), 0)
-        band_d = _score_band(score_d)
-
-        reasons = (d.get("reasons", []) or [])
-        reasons_html = "<ul class='compact'>" + "".join(f"<li>{_html_escape(r)}</li>" for r in reasons) + "</ul>"
-
-        unlock_flag = bool(d.get("malicious_unlock", False))
-        cap_flag = bool(d.get("benign_cap_applied", False))
-
-        ref_note = "<div class='small muted'>"
-        parts = []
-        parts.append(f"Conservative score (used): <b>{_html_escape(score_d)}</b>/100")
-        parts.append(f"Unlock: <b>{'YES' if unlock_flag else 'NO'}</b>")
-        parts.append(f"Cap applied: <b>{'YES' if cap_flag else 'NO'}</b>")
-        ref_note += " • ".join(parts) + "</div>"
-
-        art_name = str(d.get("artifact_name", ""))
-        report_href = _pick_existing_report_href(reports_dir, art_name) if art_name else ""
-        json_href = _artifact_json_href(art_name) if art_name else ""
-
-        dyn_rows += (
-            "<tr>"
-            f"<td>{_html_escape(d.get('app_name') or '')}</td>"
-            f"<td><code>{_html_escape(d.get('package',''))}</code></td>"
-            f"<td class='small'>tag=<code>{_html_escape(d.get('tag',''))}</code><div class='muted small'>{_html_escape(d.get('device_serial',''))}</div></td>"
-            f"<td><span class='badge sev {sev_badge_class(sev_d)}'>{_html_escape(sev_d)}</span></td>"
-            f"<td>"
-            f"  <span class='badge score {band_d}'>Score: <b>{_html_escape(score_d)}</b>/100</span>"
-            f"  <div class='pills-inline'>{_pill_bool('Unlock', unlock_flag)}{_pill_bool('Cap', cap_flag)}</div>"
-            f"</td>"
-            f"<td class='small'><code>{_html_escape(art_name)}</code><div class='muted small'>{_html_escape(d.get('artifact_mtime_utc',''))}</div></td>"
-            f"<td class='actions-td'>{_btn(report_href, 'Open Report', 'primary')}</td>"
-            f"<td class='actions-td'>{_btn(json_href, 'Open JSON', 'secondary')}</td>"
-            "</tr>"
-        )
-
-        dyn_why += (
-            "<div class='why-card'>"
-            f"<div class='why-title'>Dynamic run <span class='muted'>({_html_escape(d.get('package',''))})</span></div>"
-            f"<div class='why-meta'>"
-            f"<span class='badge sev {sev_badge_class(sev_d)}'>{_html_escape(sev_d)}</span>"
-            f"<span class='badge score {band_d}'>Score: <b>{_html_escape(score_d)}</b>/100</span>"
-            f"{_pill_bool('Unlock', unlock_flag)}"
-            f"{_pill_bool('Cap', cap_flag)}"
-            f"<span class='pill'>Artifact: <code>{_html_escape(art_name)}</code></span>"
-            f"<span class='pill'>Run: <span class='mono'>{_html_escape(d.get('artifact_mtime_utc',''))}</span></span>"
-            f"</div>"
-            f"<div class='why-actions'>{_btn(report_href, 'Open Report')}{_btn(json_href, 'Open JSON', 'secondary')}</div>"
-            f"{ref_note}"
-            f"{reasons_html}"
-            "</div>"
-        )
-
-    if not dyn_rows:
-        dyn_rows = "<tr><td colspan='8'><i>No APK dynamic artifacts found.</i></td></tr>"
-    if not dyn_why:
-        dyn_why = "<i>No dynamic scoring reasons available.</i>"
-
-    # Case-level note about cap/unlock
-    cap_note = ""
-    if benign_cap and not unlock:
-        cap_note = (
-            "<div class='small muted' style='margin-top:8px;'>"
-            "<b>Benign-aware cap:</b> no high-confidence malware indicators detected → score capped at <b>19/100</b>."
-            "</div>"
-        )
-    if unlock:
-        cap_note = (
-            "<div class='small muted' style='margin-top:8px;'>"
-            "<b>Malicious unlock:</b> strong indicators detected → score may exceed 19/100."
-            "</div>"
-        )
-
-    quick_links = ""
-    if latest_art:
-        quick_links = (
-            "<div class='row' style='margin-top:10px; gap:10px;'>"
-            f"{_btn(latest_report_href, 'Open Latest Report')}"
-            f"{_btn(latest_json_href, 'Open Latest JSON', 'secondary')}"
-            "</div>"
-        )
-
-    # Risk-mode compare links (generate separate files)
-    mode_links = (
-        "<div class='row' style='margin-top:10px; gap:10px;'>"
-        f"{_btn('case_report__latest.html', 'Mode: latest', 'secondary')}"
-        f"{_btn('case_report__max.html', 'Mode: max', 'secondary')}"
-        f"{_btn('case_report__mean.html', 'Mode: mean', 'secondary')}"
-        "</div>"
-    )
-
-    html = f"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Case Report - {_html_escape(summary['case_id'])}</title>
-<style>
-:root {{
-  --bg: #0b1020;
-  --border: rgba(255,255,255,0.09);
-  --text: rgba(255,255,255,0.92);
-  --muted: rgba(255,255,255,0.66);
-  --shadow: 0 12px 40px rgba(0,0,0,0.22);
-}}
-
-body {{
-  margin: 0;
-  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-  background: radial-gradient(1200px 800px at 20% -10%, rgba(0,153,255,0.20), transparent 60%),
-              radial-gradient(1000px 700px at 90% 0%, rgba(120,66,255,0.22), transparent 55%),
-              radial-gradient(900px 600px at 40% 110%, rgba(0,255,170,0.12), transparent 55%),
-              var(--bg);
-  color: var(--text);
-}}
-
-.container {{
-  max-width: 1250px;
-  margin: 28px auto;
-  padding: 0 18px 40px 18px;
-}}
-
-h1 {{
-  margin: 0 0 8px 0;
-  letter-spacing: 0.6px;
-}}
-
-.sub {{
-  color: var(--muted);
-  margin-bottom: 18px;
-}}
-
-.topbar {{
-  position: sticky;
-  top: 0;
-  z-index: 50;
-  backdrop-filter: blur(10px);
-  background: linear-gradient(180deg, rgba(11,16,32,0.92), rgba(11,16,32,0.65));
-  border-bottom: 1px solid rgba(255,255,255,0.09);
-}}
-.topbar .inner {{
-  max-width: 1250px;
-  margin: 0 auto;
-  padding: 10px 18px;
-  display:flex;
-  flex-wrap:wrap;
-  gap: 10px;
-  align-items:center;
-  justify-content: space-between;
-}}
-.brand {{
-  display:flex;
-  flex-wrap:wrap;
-  align-items:center;
-  gap:10px;
-}}
-.brand .title {{
-  font-weight: 950;
-  letter-spacing: 0.4px;
-}}
-.nav {{
-  display:flex;
-  flex-wrap:wrap;
-  gap: 8px;
-  align-items:center;
-}}
-.nav a {{
-  display:inline-flex;
-  align-items:center;
-  gap:8px;
-  padding: 8px 10px;
-  border-radius: 999px;
-  border: 1px solid rgba(255,255,255,0.10);
-  background: rgba(255,255,255,0.03);
-  color: rgba(255,255,255,0.86);
-  font-weight: 900;
-  text-decoration: none;
-}}
-.nav a:hover {{
-  background: rgba(255,255,255,0.06);
-}}
-
-.card {{
-  background: linear-gradient(180deg, rgba(18,24,40,0.86), rgba(12,16,28,0.82));
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 14px 16px;
-  margin: 14px 0;
-  box-shadow: var(--shadow);
-}}
-
-.row {{
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  align-items: center;
-}}
-
-.badge {{
-  display:inline-flex;
-  align-items:center;
-  gap: 8px;
-  padding: 7px 12px;
-  border-radius: 999px;
-  font-weight: 900;
-  letter-spacing: 0.2px;
-  border: 1px solid rgba(255,255,255,0.14);
-  line-height: 1.2;
-}}
-
-.badge.sev {{ text-transform: uppercase; }}
-.badge.score {{ font-weight: 900; }}
-
-.pill {{
-  display:inline-flex;
-  align-items:center;
-  gap: 8px;
-  padding: 7px 12px;
-  border-radius: 999px;
-  border: 1px solid rgba(255,255,255,0.10);
-  color: var(--muted);
-  background: rgba(255,255,255,0.04);
-  line-height: 1.2;
-}}
-
-.pill-ok {{
-  border-color: rgba(0,255,170,0.22);
-  background: rgba(0,255,170,0.10);
-  color: rgba(140,255,210,0.95);
-}}
-.pill-no {{
-  border-color: rgba(255,255,255,0.12);
-  background: rgba(255,255,255,0.04);
-  color: rgba(255,255,255,0.70);
-}}
-
-.pills-inline {{
-  display:flex;
-  flex-wrap:wrap;
-  gap: 8px;
-  margin-top: 8px;
-}}
-
-.muted {{ color: var(--muted); }}
-.small {{ font-size: 0.92em; color: rgba(255,255,255,0.72); }}
-.mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
-
-code {{
-  background: rgba(255,255,255,0.06);
-  padding: 2px 7px;
-  border-radius: 8px;
-  border: 1px solid rgba(255,255,255,0.08);
-  color: rgba(255,255,255,0.92);
-  display: inline-block;
-}}
-
-pre {{
-  background: rgba(255,255,255,0.05);
-  border: 1px solid rgba(255,255,255,0.08);
-  padding: 12px;
-  border-radius: 14px;
-  overflow:auto;
-  color: rgba(255,255,255,0.90);
-}}
-
-table {{
-  width: 100%;
-  border-collapse: collapse;
-  overflow: hidden;
-  border-radius: 14px;
-}}
-
-th, td {{
-  text-align: left;
-  padding: 10px;
-  border-bottom: 1px solid rgba(255,255,255,0.08);
-  vertical-align: top;
-  line-height: 1.35;
-}}
-
-th {{
-  color: rgba(255,255,255,0.78);
-  font-weight: 900;
-  background: rgba(255,255,255,0.03);
-}}
-
-.actions-td {{
-  white-space: nowrap;
-}}
-
-.btn {{
-  display:inline-flex;
-  align-items:center;
-  gap: 8px;
-  padding: 9px 12px;
-  border-radius: 12px;
-  border: 1px solid rgba(255,255,255,0.14);
-  background: rgba(255,255,255,0.06);
-  color: rgba(255,255,255,0.92);
-  text-decoration: none;
-  font-weight: 900;
-  letter-spacing: .2px;
-}}
-.btn:hover {{
-  background: rgba(255,255,255,0.08);
-  border-color: rgba(255,255,255,0.22);
-}}
-.btn.ghost {{
-  background: rgba(255,255,255,0.03);
-  border-color: rgba(255,255,255,0.10);
-  color: rgba(255,255,255,0.85);
-}}
-.btn.ghost:hover {{
-  background: rgba(255,255,255,0.06);
-}}
-
-.compact {{
-  margin: 8px 0 0 18px;
-  padding: 0;
-}}
-.compact li {{ margin: 6px 0; }}
-
-.why-card {{
-  background: rgba(255,255,255,0.04);
-  border: 1px solid rgba(255,255,255,0.09);
-  border-radius: 14px;
-  padding: 12px 14px;
-  margin: 10px 0;
-}}
-.why-title {{
-  font-weight: 950;
-  letter-spacing: 0.2px;
-  margin-bottom: 6px;
-}}
-.why-meta {{
-  display:flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  align-items: center;
-  margin-bottom: 8px;
-}}
-.why-actions {{
-  display:flex;
-  flex-wrap:wrap;
-  gap: 10px;
-  margin: 10px 0 6px;
-}}
-
-.LOW {{
-  background: rgba(0,255,160,0.10);
-  color: rgba(140,255,210,0.95);
-}}
-.MEDIUM {{
-  background: rgba(255,190,0,0.12);
-  color: rgba(255,210,110,0.95);
-}}
-.HIGH {{
-  background: rgba(255,80,80,0.12);
-  color: rgba(255,170,170,0.95);
-}}
-.CRITICAL {{
-  background: rgba(255,40,120,0.14);
-  color: rgba(255,170,210,0.95);
-}}
-.UNKNOWN {{
-  background: rgba(255,255,255,0.06);
-  color: rgba(255,255,255,0.82);
-}}
-
-.SCORE_GREEN {{
-  background: rgba(0,255,170,0.10);
-  color: rgba(140,255,210,0.95);
-  border-color: rgba(0,255,170,0.22);
-}}
-.SCORE_YELLOW {{
-  background: rgba(255,205,0,0.12);
-  color: rgba(255,220,130,0.95);
-  border-color: rgba(255,205,0,0.22);
-}}
-.SCORE_ORANGE {{
-  background: rgba(255,130,0,0.12);
-  color: rgba(255,190,140,0.95);
-  border-color: rgba(255,130,0,0.22);
-}}
-.SCORE_RED {{
-  background: rgba(255,60,60,0.12);
-  color: rgba(255,175,175,0.95);
-  border-color: rgba(255,60,60,0.22);
-}}
-
-.hr {{
-  height: 1px;
-  background: rgba(255,255,255,0.08);
-  margin: 10px 0;
-}}
-</style>
-</head>
-<body>
-
-<div class="topbar" id="top">
-  <div class="inner">
-    <div class="brand">
-      <div class="title">CYBERSHADOW • Case Report</div>
-      <span class="pill"><b>Case:</b> <span class="mono">{_html_escape(summary["case_id"])}</span></span>
-      <span class="pill"><b>Mode:</b> <span class="mono">{_html_escape(rm)}</span></span>
-    </div>
-    <div class="nav">
-      <a href="#overview">Overview</a>
-      <a href="#evidence">Evidence</a>
-      <a href="#static">Static</a>
-      <a href="#dynamic">Dynamic</a>
-      <a href="#env">Env</a>
-      <a href="#top">Top</a>
+    mem_panel = f"""
+  <div class="card panel" id="panel_memlite" data-panel="main">
+    <h2>MemLite artifacts</h2>
+    <div class="body">
+      <table class="table">
+        <thead><tr><th>Artifact</th><th>Severity</th><th>Score</th><th>Package</th></tr></thead>
+        <tbody>{mem_rows}</tbody>
+      </table>
+      <div class="section">{mem_why}</div>
     </div>
   </div>
-</div>
-
-<div class="container">
-  <h1 id="overview">Hybrid Forensic Case Report</h1>
-  <div class="sub">Case-level aggregation and traceable scoring summary</div>
-
-  <div class="card">
-    <div class="row">
-      {_pill("Case ID", summary['case_id'])}
-      {_pill("Created", summary['created_at_utc'])}
-      <span class="badge sev {sev_badge_class(sev)}">{_html_escape(sev)}</span>
-      <span class="badge score {score_band}">Final Score: <b>{_html_escape(score)}</b>/100</span>
-      {_pill("Modules", ", ".join(summary["modules_present"]) if summary["modules_present"] else "None")}
-      {_pill("Risk mode", rm)}
-      {_pill_bool("Malicious unlock", unlock)}
-      {_pill_bool("Benign cap", benign_cap)}
-      {_pill("Latest artifact", latest_art)}
-      {_pill("Latest kind", latest_kind)}
-    </div>
-
-    <div class="small muted" style="margin-top:10px;">
-      Latest = verdict from most recent artifact • Max = worst-case across artifacts • Mean = avg(latest static, latest dynamic)
-    </div>
-
-    {cap_note}
-    {quick_links}
-    {mode_links}
-  </div>
-
-  <div class="card" id="evidence">
-    <div class="row" style="justify-content:space-between;">
-      <div class="row">
-        <h2 style="margin:0;">Evidence Registry</h2>
-        <span class="muted">({_html_escape(len(summary['evidence']))} unique item(s))</span>
-      </div>
-    </div>
-    <table>
-      <tr><th>Name</th><th>Type</th><th>SHA-256</th></tr>
-      {evidence_rows}
-    </table>
-  </div>
-
-  <div class="card" id="static">
-    <div class="row">
-      <h2 style="margin:0;">APK Static Analysis Summary</h2>
-      <span class="muted">(one row per analyzed artifact)</span>
-    </div>
-    <table>
-      <tr>
-        <th>App</th><th>Package</th><th>Version</th><th>Severity</th><th>Score</th><th>Artifact</th><th>Report</th><th>JSON</th>
-      </tr>
-      {static_rows}
-    </table>
-
-    <div class="hr"></div>
-    <div class="row">
-      <h2 style="margin:0;">Why this static score</h2>
-      <span class="muted">weighted indicators (as reported by static scoring engine)</span>
-    </div>
-    {static_why}
-  </div>
-
-  <div class="card" id="dynamic">
-    <div class="row">
-      <h2 style="margin:0;">APK Dynamic Analysis Summary</h2>
-      <span class="muted">(artifact scoring is benign-aware)</span>
-    </div>
-    <table>
-      <tr>
-        <th>App</th><th>Package</th><th>Run</th><th>Severity</th><th>Score + Flags</th><th>Artifact</th><th>Report</th><th>JSON</th>
-      </tr>
-      {dyn_rows}
-    </table>
-
-    <div class="hr"></div>
-    <div class="row">
-      <h2 style="margin:0;">Why this dynamic score</h2>
-      <span class="muted">runtime indicators</span>
-    </div>
-    {dyn_why}
-  </div>
-
-  <div class="card" id="env">
-    <div class="row">
-      <h2 style="margin:0;">Reproducibility (Environment)</h2>
-      <span class="muted">snapshot used to reproduce the run</span>
-    </div>
-    <pre>{_html_escape(json.dumps(summary.get("env",{}), indent=2, ensure_ascii=False))}</pre>
-  </div>
-
-</div>
-</body>
-</html>
 """
 
-    reports_dir.mkdir(parents=True, exist_ok=True)
+    # --- Top / Why panel ---
+    top_panel = f"""
+  <div class="card panel" id="panel_top" data-panel="main">
+    <h2>Why this verdict</h2>
+    <div class="body">
+      <div class="why-card">
+        <div class="why-title">Final aggregation</div>
+        <div class="why-meta">
+          <span class="badge sev {sev_badge_class(final_sev)}">{_escape(final_sev)}</span>
+          <span class="badge score {final_band}">Final Score: <b>{final_score}</b>/100</span>
+          <span class="pill">Base (Static/Dynamic): <b class="mono">{max(static_score, dyn_score)}</b></span>
+          <span class="pill">YARA unlock: <b>{'YES' if yara_unlock else 'NO'}</b></span>
+        </div>
+        {reasons_html}
+      </div>
+      <div class="small muted">Tip: keep YARA + MemLite capped to avoid benign inflation. Only allow unlock on curated high-confidence rules.</div>
+    </div>
+  </div>
+"""
 
-    # Always write mode-specific file
-    out_mode = reports_dir / f"case_report__{rm}.html"
-    out_mode.write_text(html, encoding="utf-8")
+    footer = f"""
+  <div class="footer">Generated by CYBERSHADOW • {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")}</div>
+</div>
+"""
 
-    # Convenience: always keep case_report.html as "latest"
-    # (so UI can open a stable path)
-    if rm == "latest":
-        out_default = reports_dir / "case_report.html"
-        out_default.write_text(html, encoding="utf-8")
-        return str(out_default)
+    body = header + "<div class='tabpanels'>" + overview + static_panel + dyn_panel + yara_panel + mem_panel + top_panel + "</div>" + footer
+    html = _html_page(f"CYBERSHADOW Case Report • {meta.get('id','')}", body)
 
-    return str(out_mode)
+    out_path = case_path / f"case__{meta.get('id', case_path.name)}.html"
+    out_path.write_text(html, encoding="utf-8")
+    return str(out_path)

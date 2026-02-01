@@ -5,6 +5,7 @@ import argparse
 import json
 import sys
 import subprocess
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +15,11 @@ from src.env_report import get_versions
 from src.report_html import generate_apk_html_report
 from src.case_report import write_case_html
 from src.ledger import ledger_update, ledger_verify
+from src.memory.yara_runner import scan_apk_with_yara, save_yara_artifact
+from src.memory.memlite_android import collect_memlite, save_memlite_artifact
+
+# Final risk aggregation
+from src.risk_aggregator import aggregate_case_risk, save_risk_artifact
 
 
 def _sanitize_stem(path_str: str) -> str:
@@ -85,7 +91,6 @@ def _run_frida_auto(
     if serial:
         cmd += ["--serial", str(serial)]
 
-    # Optional URL seeding (only if your local frida_auto.py supports these flags)
     if seed_url:
         cmd += ["--seed-url", str(seed_url)]
         cmd += ["--seed-repeat", str(int(seed_repeat))]
@@ -175,8 +180,39 @@ def main():
     c8.add_argument("--seed-repeat", type=int, default=0)
     c8.add_argument("--seed-interval", type=int, default=3)
 
+    # optional extras
+    c8.add_argument("--yara", action="store_true", help="Run YARA scan on APK and include in case artifacts")
+    c8.add_argument("--yara-rules", default=None, help="Path to YARA rules file or directory")
+    c8.add_argument("--memlite", action="store_true", help="Collect non-root procfs/logcat/network snapshots for the package")
+    c8.add_argument("--memlite-after-dynamic", action="store_true", help="Run memlite after dynamic (default: before/without)")
+
+    # NEW: final risk artifact
+    c8.add_argument("--final-risk", action="store_true", help="Compute and save risk__<tag>.json at end of pipeline")
+
     # ---------- ENV ----------
     c9 = sub.add_parser("env")
+
+    # ---------- YARA ----------
+    cy = sub.add_parser("yara-scan")
+    cy.add_argument("--case", required=True)
+    cy.add_argument("--apk", required=True)
+    cy.add_argument("--tag", default="yara")
+    cy.add_argument("--rules", default=None)
+    cy.add_argument("--timeout", type=int, default=30)
+
+    # ---------- MEMLITE (ANDROID) ----------
+    cm = sub.add_parser("memlite")
+    cm.add_argument("--case", required=True)
+    cm.add_argument("--package", required=True)
+    cm.add_argument("--tag", default="mem")
+    cm.add_argument("--serial", default="")
+    cm.add_argument("--endpoint", default="127.0.0.1:27042")
+
+    # ---------- FINAL RISK ----------
+    cr = sub.add_parser("risk")
+    cr.add_argument("--case", required=True)
+    cr.add_argument("--tag", required=True)
+    cr.add_argument("--no-save", action="store_true", help="Only print JSON; don't save risk__<tag>.json")
 
     args = p.parse_args()
     rc = 0
@@ -244,6 +280,34 @@ def main():
             print(json.dumps(result, indent=2))
             rc = 0 if result.get("ok") else 2
 
+        elif args.cmd == "env":
+            print(json.dumps(get_versions(), indent=2))
+
+        elif args.cmd == "yara-scan":
+            _ensure_case_exists(args.case)
+            add_evidence(args.case, args.apk, "apk")
+            copied_apk = str(Path(args.case) / "evidence" / Path(args.apk).name)
+            obj = scan_apk_with_yara(apk_path=copied_apk, rules_path=args.rules, timeout_s=int(args.timeout))
+            out_path = save_yara_artifact(args.case, tag=str(args.tag), yara_obj=obj)
+            print(f"Saved: {out_path}")
+            print(json.dumps(obj.get("scoring", {}), indent=2))
+
+        elif args.cmd == "memlite":
+            _ensure_case_exists(args.case)
+            obj = collect_memlite(pkg=args.package, serial=args.serial)
+            out_path = save_memlite_artifact(args.case, tag=str(args.tag), obj=obj)
+            print(f"Saved: {out_path}")
+            print(json.dumps(obj.get("scoring", {}), indent=2))
+
+        elif args.cmd == "risk":
+            _ensure_case_exists(args.case)
+            tag = str(args.tag)
+            obj = aggregate_case_risk(str(args.case), tag=tag)
+            if not bool(getattr(args, "no_save", False)):
+                out_path = save_risk_artifact(str(args.case), tag=tag, obj=obj)
+                print(f"Saved: {out_path}")
+            print(json.dumps(obj, indent=2))
+
         elif args.cmd == "run-apk":
             set_verbose(args.verbose)
             case_dir = args.case
@@ -261,6 +325,30 @@ def main():
             artifact_path = save_artifact(case_dir, artifact_name, info)
 
             apk_report_path = generate_apk_html_report(case_dir, apk_artifact=artifact_name)
+
+            yara_path = None
+            if bool(getattr(args, "yara", False)):
+                yara_obj = scan_apk_with_yara(
+                    apk_path=copied_apk,
+                    rules_path=getattr(args, "yara_rules", None),
+                )
+                yara_path = save_yara_artifact(case_dir, tag=tag, yara_obj=yara_obj)
+
+            memlite_path = None
+            pkg_for_memlite = str(info.get("package") or "")
+
+            def _do_memlite():
+                nonlocal memlite_path
+                if not pkg_for_memlite:
+                    return
+                objm = collect_memlite(
+                    pkg=pkg_for_memlite,
+                    serial=str(getattr(args, "serial", "") or ""),
+                )
+                memlite_path = save_memlite_artifact(case_dir, tag=tag, obj=objm)
+
+            if bool(getattr(args, "memlite", False)) and not bool(getattr(args, "memlite_after_dynamic", False)):
+                _do_memlite()
 
             dyn_rc = None
             pkg = str(info.get("package") or "")
@@ -287,7 +375,16 @@ def main():
                     seed_interval=args.seed_interval,
                 )
 
+            if bool(getattr(args, "memlite", False)) and bool(getattr(args, "memlite_after_dynamic", False)):
+                _do_memlite()
+
             case_report_path = write_case_html(case_dir, risk_mode=args.risk_mode)
+
+            risk_path = None
+            risk_obj = None
+            if bool(getattr(args, "final_risk", False)):
+                risk_obj = aggregate_case_risk(case_dir, tag=tag)
+                risk_path = save_risk_artifact(case_dir, tag=tag, obj=risk_obj)
 
             ledger_path = None
             ledger_ok = None
@@ -313,17 +410,22 @@ def main():
             print(f"Static Artifact: {artifact_path}")
             print(f"APK Report: {apk_report_path}")
             print(f"Case Report: {case_report_path}")
+            if yara_path:
+                print(f"YARA Artifact: {yara_path}")
+            if memlite_path:
+                print(f"MemLite Artifact: {memlite_path}")
+            if risk_path:
+                print(f"Final Risk Artifact: {risk_path}")
+                print(f"Final Risk: {risk_obj.get('score')} / 100 | {risk_obj.get('severity')}")
             if ledger_path:
                 print(f"Ledger: {ledger_path} | Verified: {ledger_ok}")
                 if ledger_details and not ledger_ok:
                     print(json.dumps(ledger_details, indent=2))
 
-        elif args.cmd == "env":
-            print(json.dumps(get_versions(), indent=2))
-
     except Exception as e:
         rc = 1
-        print(f"[ERROR] {e}")
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        traceback.print_exc()
 
     print(f"[DONE] return code: {rc}")
     raise SystemExit(rc)

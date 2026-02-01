@@ -329,11 +329,50 @@ class CyberShadowHub(ctk.CTk):
         return os.path.join(case_abs, "artifacts")
 
     def _case_report_path(self) -> Optional[str]:
-        rep_dir = self._case_reports_dir()
-        if not rep_dir or not os.path.isdir(rep_dir):
+        """
+        Case report may be saved either as:
+          - <case>/case__<case_id>.html (your generator)
+          - <case>/reports/case_report.html (older/alternate)
+          - <case>/case_report.html (rare)
+        We pick the newest matching HTML.
+        """
+        case_abs = self._case_abs()
+        if not case_abs or not os.path.isdir(case_abs):
             return None
-        p = os.path.join(rep_dir, "case_report.html")
-        return p if os.path.exists(p) else None
+
+        cands: List[str] = []
+
+        # 1) common: in case root
+        try:
+            for name in os.listdir(case_abs):
+                if not name.lower().endswith(".html"):
+                    continue
+                if name.lower().startswith("case__") or name.lower() == "case_report.html":
+                    cands.append(os.path.join(case_abs, name))
+        except Exception:
+            pass
+
+        # 2) reports folder variants
+        rep_dir = self._case_reports_dir()
+        if rep_dir and os.path.isdir(rep_dir):
+            try:
+                p = os.path.join(rep_dir, "case_report.html")
+                if os.path.exists(p):
+                    cands.append(p)
+                for name in os.listdir(rep_dir):
+                    if not name.lower().endswith(".html"):
+                        continue
+                    if name.lower().startswith("case__") or name.lower() == "case_report.html":
+                        cands.append(os.path.join(rep_dir, name))
+            except Exception:
+                pass
+
+        cands = [p for p in cands if p and os.path.exists(p)]
+        if not cands:
+            return None
+
+        cands.sort(key=lambda fp: os.path.getmtime(fp), reverse=True)
+        return cands[0]
 
     # ---------------- Report naming helpers ----------------
     @staticmethod
@@ -343,6 +382,12 @@ class CyberShadowHub(ctk.CTk):
             return "STATIC"
         if n.startswith("apk_dynamic__"):
             return "DYNAMIC"
+        if n.startswith("yara__"):
+            return "YARA"
+        if n.startswith("memlite__"):
+            return "MEMLITE"
+        if n.startswith("risk_aggregate__") or n.startswith("risk__") or n.startswith("risk_aggregate"):
+            return "RISK"
         return "UNKNOWN"
 
     @staticmethod
@@ -679,7 +724,7 @@ class CyberShadowHub(ctk.CTk):
         action.grid_columnconfigure(1, weight=1)
 
         self.btn_run = ctk.CTkButton(
-            action, text="RUN APK ANALYSIS", command=self._run_apk,
+            action, text="RUN FULL PIPELINE", command=self._run_full_pipeline,
             fg_color="#1D4ED8", hover_color="#2563EB",
             height=44, font=ctk.CTkFont(size=14, weight="bold")
         )
@@ -692,6 +737,39 @@ class CyberShadowHub(ctk.CTk):
             state="disabled"
         )
         self.btn_stop.grid(row=0, column=1, sticky="ew")
+
+        # Secondary action row: individual module buttons
+        action2 = ctk.CTkFrame(parent, fg_color="transparent")
+        action2.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+        action2.grid_columnconfigure((0, 1, 2, 3), weight=1)
+
+        self.btn_static_only = ctk.CTkButton(
+            action2, text="Run Static Only", command=self._run_static_only,
+            fg_color="#0F766E", hover_color="#14B8A6",
+            height=38, font=ctk.CTkFont(size=13, weight="bold")
+        )
+        self.btn_static_only.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+
+        self.btn_yara_only = ctk.CTkButton(
+            action2, text="Run YARA Only", command=self._run_yara_only,
+            fg_color="#7C3AED", hover_color="#8B5CF6",
+            height=38, font=ctk.CTkFont(size=13, weight="bold")
+        )
+        self.btn_yara_only.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+
+        self.btn_memlite_only = ctk.CTkButton(
+            action2, text="Run MemLite Only", command=self._run_memlite_only,
+            fg_color="#1E3A8A", hover_color="#2563EB",
+            height=38, font=ctk.CTkFont(size=13, weight="bold")
+        )
+        self.btn_memlite_only.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+
+        self.btn_final_risk = ctk.CTkButton(
+            action2, text="Compute Final Risk", command=self._compute_final_risk,
+            fg_color="#334155", hover_color="#475569",
+            height=38, font=ctk.CTkFont(size=13, weight="bold")
+        )
+        self.btn_final_risk.grid(row=0, column=3, sticky="ew")
 
         # ---- Case Folder
         ctk.CTkLabel(
@@ -725,7 +803,7 @@ class CyberShadowHub(ctk.CTk):
         self.risk_mode_var = ctk.StringVar(value="latest")
         self.risk_mode_menu = ctk.CTkOptionMenu(
             row_risk,
-            values=["latest", "max"],
+            values=["latest", "max", "mean"],
             variable=self.risk_mode_var,
             fg_color="#0A1222",
             button_color="#1E3A8A",
@@ -735,7 +813,7 @@ class CyberShadowHub(ctk.CTk):
 
         ctk.CTkLabel(
             row_risk,
-            text="latest = last run • max = worst-case",
+            text="latest = last run • max = worst-case • mean = avg",
             text_color="#94A3B8"
         ).grid(row=0, column=1, sticky="e")
 
@@ -767,13 +845,71 @@ class CyberShadowHub(ctk.CTk):
         self.tag_entry.grid(row=7, column=0, sticky="ew", pady=(0, 10))
         self.tag_entry.insert(0, "run1")
 
+        # ---- Extras: YARA rules + MemLite serial
+        ctk.CTkLabel(
+            scroll, text="Extras (optional)", text_color="#E5E7EB",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).grid(row=8, column=0, sticky="w", pady=(10, 6))
+
+        row_rules = ctk.CTkFrame(scroll, fg_color="transparent")
+        row_rules.grid(row=9, column=0, sticky="ew", pady=(0, 10))
+        row_rules.grid_columnconfigure(0, weight=1)
+
+        self.yara_rules_entry = ctk.CTkEntry(row_rules, placeholder_text=r".\rules\yara")
+        self.yara_rules_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.yara_rules_entry.insert(0, os.path.join(".", "rules", "yara"))
+
+        ctk.CTkButton(
+            row_rules, text="Browse Rules", command=self._browse_yara_rules,
+            fg_color="#1E3A8A", hover_color="#2563EB", height=36
+        ).grid(row=0, column=1)
+
+        row_serial = ctk.CTkFrame(scroll, fg_color="transparent")
+        row_serial.grid(row=10, column=0, sticky="ew", pady=(0, 10))
+        row_serial.grid_columnconfigure((0, 1), weight=1)
+
+        self.include_yara_var = ctk.BooleanVar(value=True)
+        self.include_memlite_var = ctk.BooleanVar(value=True)
+
+        self.chk_include_yara = ctk.CTkCheckBox(
+            row_serial, text="Include YARA (full pipeline)",
+            variable=self.include_yara_var, text_color="#94A3B8"
+        )
+        self.chk_include_yara.grid(row=0, column=0, sticky="w", padx=(0, 10))
+
+        self.chk_include_memlite = ctk.CTkCheckBox(
+            row_serial, text="Include MemLite (full pipeline)",
+            variable=self.include_memlite_var, text_color="#94A3B8"
+        )
+        self.chk_include_memlite.grid(row=0, column=1, sticky="w")
+
+        row_serial2 = ctk.CTkFrame(scroll, fg_color="transparent")
+        row_serial2.grid(row=11, column=0, sticky="ew", pady=(0, 10))
+        row_serial2.grid_columnconfigure((0, 1), weight=1)
+
+        ctk.CTkLabel(
+            row_serial2, text="ADB Serial (MemLite)", text_color="#E5E7EB",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).grid(row=0, column=0, sticky="w", padx=(0, 10))
+
+        ctk.CTkLabel(
+            row_serial2, text="Package override (MemLite)", text_color="#E5E7EB",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).grid(row=0, column=1, sticky="w")
+
+        self.memlite_serial_entry = ctk.CTkEntry(row_serial2, placeholder_text="RF8N92WCTPP (optional)")
+        self.memlite_serial_entry.grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(6, 0))
+
+        self.memlite_pkg_entry = ctk.CTkEntry(row_serial2, placeholder_text="(optional) com.example.app")
+        self.memlite_pkg_entry.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+
         # ---- Load report button (kept for backward UX)
         self.btn_load_report = ctk.CTkButton(
             scroll, text="LOAD REPORT INTO VIEWER", command=self._load_report_into_viewer,
             fg_color="#0F766E", hover_color="#14B8A6", height=38,
             state="disabled"
         )
-        self.btn_load_report.grid(row=8, column=0, sticky="ew", pady=(8, 10))
+        self.btn_load_report.grid(row=12, column=0, sticky="ew", pady=(8, 10))
 
         # ---- Artifact manager
         self._build_artifact_manager(scroll)
@@ -784,6 +920,18 @@ class CyberShadowHub(ctk.CTk):
             text_color="#94A3B8",
             font=ctk.CTkFont(size=12)
         ).grid(row=999, column=0, sticky="w", pady=(8, 0))
+
+    def _browse_yara_rules(self):
+        # allow directory or file
+        path = filedialog.askdirectory(title="Select YARA rules folder")
+        if not path:
+            path = filedialog.askopenfilename(
+                title="Select YARA rules file",
+                filetypes=[("YARA", "*.yar *.yara"), ("All files", "*.*")]
+            )
+        if path:
+            self.yara_rules_entry.delete(0, "end")
+            self.yara_rules_entry.insert(0, path)
 
     # ---------------- Controls: Dynamic ----------------
     def _build_dynamic_controls(self, parent):
@@ -1038,7 +1186,15 @@ class CyberShadowHub(ctk.CTk):
 
         paths: List[str] = []
         for name in os.listdir(art_dir):
-            if (name.startswith("apk_static__") or name.startswith("apk_dynamic__")) and name.endswith(".json"):
+            if not name.endswith(".json"):
+                continue
+            if (
+                name.startswith("apk_static__")
+                or name.startswith("apk_dynamic__")
+                or name.startswith("yara__")
+                or name.startswith("memlite__")
+                or name.startswith("risk_aggregate__")
+            ):
                 paths.append(os.path.join(art_dir, name))
 
         paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
@@ -1086,7 +1242,7 @@ class CyberShadowHub(ctk.CTk):
         if not paths:
             ctk.CTkLabel(
                 self.art_scroll,
-                text="No generated artifacts found (apk_static__*.json / apk_dynamic__*.json).",
+                text="No generated artifacts found (apk_static__/apk_dynamic__/yara__/memlite__).",
                 text_color="#94A3B8"
             ).pack(anchor="w", pady=6)
             self._artifact_radio_var.set("")
@@ -1213,6 +1369,10 @@ class CyberShadowHub(ctk.CTk):
             return iocs
         runtime = obj.get("runtime", {}) or {}
         iocs = runtime.get("iocs")
+        if isinstance(iocs, dict):
+            return iocs
+        extras = obj.get("extras", {}) or {}
+        iocs = extras.get("iocs")
         if isinstance(iocs, dict):
             return iocs
         return {}
@@ -1369,7 +1529,10 @@ class CyberShadowHub(ctk.CTk):
             "Șterg DOAR outputs generate?\n\n"
             "- artifacts/apk_static__*.json\n"
             "- artifacts/apk_dynamic__*.json\n"
-            "- reports/*.html\n\n"
+            "- artifacts/yara__*.json\n"
+            "- artifacts/memlite__*.json\n"
+            "- reports/*.html\n"
+            "- case__*.html\n\n"
             "NU atinge evidence/, case.json, ledger.json."
         ):
             return
@@ -1378,7 +1541,10 @@ class CyberShadowHub(ctk.CTk):
         art_dir = os.path.join(case_abs, "artifacts")
         if os.path.isdir(art_dir):
             for name in os.listdir(art_dir):
-                if (name.startswith("apk_static__") or name.startswith("apk_dynamic__")) and name.endswith(".json"):
+                if (
+                    (name.startswith("apk_static__") or name.startswith("apk_dynamic__") or name.startswith("yara__") or name.startswith("memlite__"))
+                    and name.endswith(".json")
+                ):
                     try:
                         os.remove(os.path.join(art_dir, name))
                         removed += 1
@@ -1394,6 +1560,18 @@ class CyberShadowHub(ctk.CTk):
                         removed += 1
                     except Exception:
                         pass
+
+        # case report in root
+        try:
+            for name in os.listdir(case_abs):
+                if name.lower().endswith(".html") and (name.lower().startswith("case__") or name.lower() == "case_report.html"):
+                    try:
+                        os.remove(os.path.join(case_abs, name))
+                        removed += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         self._append_log(f"[INFO] Cleaned generated outputs. Removed: {removed}\n")
         self.btn_load_report.configure(state="disabled")
@@ -1427,6 +1605,13 @@ class CyberShadowHub(ctk.CTk):
         try:
             self.btn_run_dyn.configure(state="disabled" if running else "normal")
             self.btn_stop_dyn.configure(state="normal" if running else "disabled")
+        except Exception:
+            pass
+        try:
+            self.btn_static_only.configure(state="disabled" if running else "normal")
+            self.btn_yara_only.configure(state="disabled" if running else "normal")
+            self.btn_memlite_only.configure(state="disabled" if running else "normal")
+            self.btn_final_risk.configure(state="disabled" if running else "normal")
         except Exception:
             pass
         try:
@@ -1472,11 +1657,7 @@ class CyberShadowHub(ctk.CTk):
 
         return env
 
-    def _run_apk(self):
-        if self._proc is not None:
-            messagebox.showwarning("Already running", "Un proces rulează deja. Apasă STOP.")
-            return
-
+    def _validate_common_inputs(self) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
         case_folder = self.case_entry.get().strip()
         apk_path = self.apk_entry.get().strip()
         tag = self.tag_entry.get().strip()
@@ -1484,12 +1665,19 @@ class CyberShadowHub(ctk.CTk):
 
         if not case_folder:
             messagebox.showerror("Missing input", "Case Folder este gol.")
-            return
-        if not apk_path or not os.path.exists(apk_path):
-            messagebox.showerror("Missing input", "APK File lipsește sau nu există.")
-            return
+            return (None, None, None, None)
+        if apk_path and not os.path.exists(apk_path):
+            messagebox.showerror("Missing input", "APK File nu există.")
+            return (None, None, None, None)
         if not tag:
             messagebox.showerror("Missing input", "Tag este gol.")
+            return (None, None, None, None)
+
+        return (case_folder, apk_path, tag, risk_mode)
+
+    def _start_pipeline(self, cmds: List[List[str]], title: str):
+        if self._proc is not None:
+            messagebox.showwarning("Already running", "Un proces rulează deja. Apasă STOP.")
             return
 
         self._parser = LogParser()
@@ -1502,10 +1690,28 @@ class CyberShadowHub(ctk.CTk):
         self._render_summary()
 
         self._append_log("------------------------------------------------------------\n")
-        self._append_log("[INFO] Starting APK analysis...\n")
+        self._append_log(f"[INFO] {title}\n")
         self._set_running_ui(True)
 
+        env = self._augment_env_for_tools(os.environ.copy())
+        env["ANDROGUARD_LOGLEVEL"] = "ERROR"
+        env["LOGURU_LEVEL"] = "ERROR"
+
+        t = threading.Thread(target=self._runner_pipeline, args=(cmds, env), daemon=True)
+        t.start()
+
+    def _run_full_pipeline(self):
+        case_folder, apk_path, tag, risk_mode = self._validate_common_inputs()
+        if not case_folder or not apk_path or not tag or not risk_mode:
+            return
+        if not apk_path or not os.path.exists(apk_path):
+            messagebox.showerror("Missing input", "APK File lipsește sau nu există.")
+            return
+
         py = sys.executable
+        include_yara = bool(getattr(self, "include_yara_var", None) and self.include_yara_var.get())
+        include_memlite = bool(getattr(self, "include_memlite_var", None) and self.include_memlite_var.get())
+
         cmd = [
             py, "-m", "src.main",
             "run-apk",
@@ -1515,12 +1721,177 @@ class CyberShadowHub(ctk.CTk):
             "--risk-mode", risk_mode
         ]
 
-        env = self._augment_env_for_tools(os.environ.copy())
-        env["ANDROGUARD_LOGLEVEL"] = "ERROR"
-        env["LOGURU_LEVEL"] = "ERROR"
+        # optional: YARA + MemLite inside run-apk (supported by your main.py)
+        if include_yara:
+            cmd.append("--yara")
+            rules = (self.yara_rules_entry.get().strip() if hasattr(self, "yara_rules_entry") else "").strip()
+            if rules:
+                cmd.extend(["--yara-rules", rules])
 
-        t = threading.Thread(target=self._runner_pipeline, args=([cmd], env), daemon=True)
-        t.start()
+        if include_memlite:
+            cmd.append("--memlite")
+            serial = (self.memlite_serial_entry.get().strip() if hasattr(self, "memlite_serial_entry") else "").strip()
+            if serial:
+                cmd.extend(["--serial", serial])
+
+        # ensure case report exists/updated even if generator path changes
+        cmd_case = [
+            py, "-m", "src.main",
+            "case-report",
+            "--case", case_folder,
+            "--risk-mode", risk_mode
+        ]
+
+        self._start_pipeline([cmd, cmd_case], "Starting FULL pipeline (static + optional yara/memlite + report)…")
+
+    def _run_static_only(self):
+        case_folder, apk_path, tag, risk_mode = self._validate_common_inputs()
+        if not case_folder or not apk_path or not tag or not risk_mode:
+            return
+        if not apk_path or not os.path.exists(apk_path):
+            messagebox.showerror("Missing input", "APK File lipsește sau nu există.")
+            return
+
+        py = sys.executable
+        cmd_static = [
+            py, "-m", "src.main",
+            "apk-static",
+            "--case", case_folder,
+            "--apk", apk_path,
+            "--tag", tag
+        ]
+        cmd_case = [
+            py, "-m", "src.main",
+            "case-report",
+            "--case", case_folder,
+            "--risk-mode", risk_mode
+        ]
+        self._start_pipeline([cmd_static, cmd_case], "Starting STATIC analysis…")
+
+    def _run_yara_only(self):
+        case_folder, apk_path, tag, risk_mode = self._validate_common_inputs()
+        if not case_folder or not apk_path or not tag or not risk_mode:
+            return
+        if not apk_path or not os.path.exists(apk_path):
+            messagebox.showerror("Missing input", "APK File lipsește sau nu există.")
+            return
+
+        py = sys.executable
+        rules = (self.yara_rules_entry.get().strip() if hasattr(self, "yara_rules_entry") else "").strip()
+
+        cmd_yara = [
+            py, "-m", "src.main",
+            "yara-scan",
+            "--case", case_folder,
+            "--apk", apk_path,
+            "--tag", tag
+        ]
+        if rules:
+            cmd_yara.extend(["--rules", rules])
+
+        cmd_case = [
+            py, "-m", "src.main",
+            "case-report",
+            "--case", case_folder,
+            "--risk-mode", risk_mode
+        ]
+        self._start_pipeline([cmd_yara, cmd_case], "Starting YARA scan…")
+
+    def _infer_package_for_tag(self, case_folder: str, tag: str) -> Optional[str]:
+        # 1) package override
+        try:
+            ov = (self.memlite_pkg_entry.get().strip() if hasattr(self, "memlite_pkg_entry") else "").strip()
+            if ov:
+                return ov
+        except Exception:
+            pass
+
+        # 2) best: read apk_static__{tag}.json
+        art_dir = os.path.join(os.path.abspath(case_folder), "artifacts")
+        cand = os.path.join(art_dir, f"apk_static__{tag}.json")
+        if os.path.exists(cand):
+            obj = self._read_json_safe(cand)
+            pkg = str(obj.get("package") or "")
+            if pkg:
+                return pkg
+
+        # 3) fallback: newest apk_static__*.json
+        try:
+            if os.path.isdir(art_dir):
+                statics = [os.path.join(art_dir, n) for n in os.listdir(art_dir) if n.startswith("apk_static__") and n.endswith(".json")]
+                statics.sort(key=lambda fp: os.path.getmtime(fp), reverse=True)
+                if statics:
+                    obj = self._read_json_safe(statics[0])
+                    pkg = str(obj.get("package") or "")
+                    if pkg:
+                        return pkg
+        except Exception:
+            pass
+
+        return None
+
+    def _run_memlite_only(self):
+        case_folder, _apk_path, tag, risk_mode = self._validate_common_inputs()
+        if not case_folder or not tag or not risk_mode:
+            return
+
+        pkg = self._infer_package_for_tag(case_folder, tag)
+        if not pkg:
+            messagebox.showerror("MemLite", "Nu pot determina package-ul. Rulează Static întâi sau setează Package override (MemLite).")
+            return
+
+        serial = (self.memlite_serial_entry.get().strip() if hasattr(self, "memlite_serial_entry") else "").strip()
+
+        py = sys.executable
+        cmd_mem = [
+            py, "-m", "src.main",
+            "memlite",
+            "--case", case_folder,
+            "--package", pkg,
+            "--tag", tag
+        ]
+        if serial:
+            cmd_mem.extend(["--serial", serial])
+
+        cmd_case = [
+            py, "-m", "src.main",
+            "case-report",
+            "--case", case_folder,
+            "--risk-mode", risk_mode
+        ]
+        self._start_pipeline([cmd_mem, cmd_case], f"Starting MemLite (pkg={pkg})…")
+
+    def _compute_final_risk(self):
+        case_folder, _apk_path, tag, risk_mode = self._validate_common_inputs()
+        if not case_folder or not tag or not risk_mode:
+            return
+
+        py = sys.executable
+
+        # Print Score/Severity lines so the UI parser updates badges, then dump JSON.
+        code = (
+            "import json;"
+            "from src.risk_aggregator import aggregate_case_risk;"
+            f"r=aggregate_case_risk(r'{case_folder}', tag='{tag}');"
+            "print(f\"Score: {r.get('score',0)}/100\");"
+            "print(f\"Severity: {r.get('severity','UNKNOWN')}\");"
+            "print(json.dumps(r, indent=2))"
+        )
+
+        cmd_risk = [py, "-c", code]
+
+        cmd_case = [
+            py, "-m", "src.main",
+            "case-report",
+            "--case", case_folder,
+            "--risk-mode", risk_mode
+        ]
+
+        self._start_pipeline([cmd_risk, cmd_case], "Computing FINAL risk aggregation…")
+
+    def _run_apk(self):
+        # kept (legacy) but now points to full pipeline
+        self._run_full_pipeline()
 
     def _run_dynamic(self):
         if self._proc is not None:
@@ -1649,8 +2020,6 @@ class CyberShadowHub(ctk.CTk):
                     env=env,
                     cwd=_project_root_dir()  # <-- FIX: run from repo root
                 )
-
-
 
                 assert self._proc.stdout is not None
                 for line in self._proc.stdout:
@@ -1781,7 +2150,16 @@ class CyberShadowHub(ctk.CTk):
         if p and os.path.exists(p):
             return p
 
-        return self._latest_report_any()
+        # fallback: newest in reports OR case root
+        p2 = self._latest_report_any()
+        if p2 and os.path.exists(p2):
+            return p2
+
+        cr2 = self._case_report_path()
+        if cr2 and os.path.exists(cr2):
+            return cr2
+
+        return None
 
     def _load_report_into_viewer(self):
         # legacy button behavior: best available report
@@ -1798,7 +2176,7 @@ class CyberShadowHub(ctk.CTk):
     def _load_case_report(self):
         p = self._case_report_path()
         if not p:
-            messagebox.showinfo("Case Report", "case_report.html nu există încă (rulează o analiză / generează case report).")
+            messagebox.showinfo("Case Report", "Nu am găsit case report HTML (rulează o analiză / case-report).")
             return
         self._set_report(p)
         self.right_tabs.set("Report Viewer")
@@ -1815,7 +2193,7 @@ class CyberShadowHub(ctk.CTk):
     def _load_latest_apk_report(self):
         p = self._latest_apk_report()
         if not p:
-            messagebox.showinfo("Latest APK Report", "Nu am găsit rapoarte APK (în afară de case_report.html).")
+            messagebox.showinfo("Latest APK Report", "Nu am găsit rapoarte APK (în afară de case report).")
             return
         self._set_report(p)
         self.right_tabs.set("Report Viewer")
