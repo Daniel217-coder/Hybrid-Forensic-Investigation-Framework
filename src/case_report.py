@@ -1,8 +1,6 @@
-# src/case_report.py
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from datetime import datetime
 from typing import Literal, Any
@@ -39,6 +37,19 @@ def _safe_int(x: Any, default: int = 0) -> int:
 
 def _clamp(x: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(x)))
+
+
+def _html_escape(s: Any) -> str:
+    if s is None:
+        return ""
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#x27;")
+    )
 
 
 # --------------------------- UI scoring bands ---------------------------
@@ -84,6 +95,62 @@ def sev_badge_class(sev: str) -> str:
     if s not in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}:
         return "UNKNOWN"
     return s
+
+
+# --------------------------- Report linking (polish) ---------------------------
+
+def _artifact_json_href(artifact_name: str) -> str:
+    # case_report.html is in cases/<CASE>/reports/
+    # artifacts live in ../artifacts/
+    return f"../artifacts/{artifact_name}"
+
+
+def _artifact_stem(artifact_name: str) -> str:
+    try:
+        return Path(artifact_name).stem
+    except Exception:
+        return artifact_name
+
+
+def _candidate_report_names(artifact_name: str) -> list[str]:
+    """
+    We support multiple historical report naming conventions.
+    Priority:
+      1) apk_report__<artifact_stem>.html         (new polished)
+      2) apk_dynamic_report__<artifact_stem>.html (older dynamic)
+      3) apk_static_report__<artifact_stem>.html  (older static)
+    """
+    stem = _artifact_stem(artifact_name)
+    return [
+        f"apk_report__{stem}.html",
+        f"apk_dynamic_report__{stem}.html",
+        f"apk_static_report__{stem}.html",
+    ]
+
+
+def _pick_existing_report_href(reports_dir: Path, artifact_name: str) -> str:
+    for name in _candidate_report_names(artifact_name):
+        if (reports_dir / name).exists():
+            return name
+    # default to the new name even if not generated yet (still useful)
+    return _candidate_report_names(artifact_name)[0]
+
+
+def _btn(href: str, label: str, kind: str = "primary") -> str:
+    if not href:
+        return ""
+    cls = "btn" if kind == "primary" else "btn ghost"
+    return f"<a class='{cls}' href='{_html_escape(href)}'>{_html_escape(label)}</a>"
+
+
+def _pill(label: str, value: str, extra_cls: str = "") -> str:
+    c = f"pill {extra_cls}".strip()
+    return f"<span class='{c}'><b>{_html_escape(label)}:</b> {_html_escape(value)}</span>"
+
+
+def _pill_bool(label: str, val: bool) -> str:
+    cls = "pill-ok" if bool(val) else "pill-no"
+    return f"<span class='pill {cls}'><b>{_html_escape(label)}:</b> {'YES' if bool(val) else 'NO'}</span>"
 
 
 # --------------------------- Artifact parsing ---------------------------
@@ -178,7 +245,6 @@ def _normalize_dynamic(artifacts: list[Path]) -> list[dict]:
                     "key_counts": runtime.get("key_counts") or {},
                     "unlock_triggers": runtime.get("unlock_triggers") or [],
                 },
-                # optional, if present in your pipeline
                 "iocs_split": obj.get("iocs_split") or {},
             }
         )
@@ -298,9 +364,16 @@ def build_case_summary(case_dir: str, risk_mode: RiskMode = "latest") -> dict:
 
 
 def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
+    """
+    Generates a case-level HTML report.
+    - Always writes cases/<CASE>/reports/case_report.html (for convenience)
+    - Also writes cases/<CASE>/reports/case_report__<risk_mode>.html (so you can compare latest/max/mean)
+    """
     summary = build_case_summary(case_dir, risk_mode=risk_mode)
 
     case_path = Path(case_dir)
+    reports_dir = case_path / "reports"
+
     score = int(summary["risk"]["score"])
     sev = str(summary["risk"]["severity"])
     rm = str(summary["risk"]["risk_mode"])
@@ -311,14 +384,18 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
     benign_cap = bool(summary["risk"].get("benign_cap_applied", False))
     unlock = bool(summary["risk"].get("malicious_unlock", False))
 
+    # Quick links (latest)
+    latest_report_href = _pick_existing_report_href(reports_dir, latest_art) if latest_art else ""
+    latest_json_href = _artifact_json_href(latest_art) if latest_art else ""
+
     # Evidence table
     evidence_rows = ""
     for e in summary.get("evidence", []) or []:
         evidence_rows += (
             "<tr>"
-            f"<td>{e.get('name','')}</td>"
-            f"<td><span class='pill'>{e.get('type','')}</span></td>"
-            f"<td class='mono'>{e.get('sha256','')}</td>"
+            f"<td>{_html_escape(e.get('name',''))}</td>"
+            f"<td><span class='pill'><b>Type:</b> {_html_escape(e.get('type',''))}</span></td>"
+            f"<td class='mono'>{_html_escape(e.get('sha256',''))}</td>"
             "</tr>"
         )
     if not evidence_rows:
@@ -333,44 +410,51 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
         band_m = _score_band(score_m)
 
         reasons = (m.get("reasons", []) or [])
-        reasons_html = "<ul class='compact'>" + "".join(f"<li>{r}</li>" for r in reasons) + "</ul>"
+        reasons_html = "<ul class='compact'>" + "".join(f"<li>{_html_escape(r)}</li>" for r in reasons) + "</ul>"
 
         engine_sev = m.get("engine_severity", None)
         ref_note = ""
         if engine_sev and engine_sev != sev_m:
             ref_note = (
                 "<div class='small muted'>"
-                f"Engine severity (ref): <b>{engine_sev}</b> • Derived severity (used): <b>{sev_m}</b>"
+                f"Engine severity (ref): <b>{_html_escape(engine_sev)}</b> • Derived severity (used): <b>{_html_escape(sev_m)}</b>"
                 "</div>"
             )
 
+        art_name = str(m.get("artifact_name", ""))
+        report_href = _pick_existing_report_href(reports_dir, art_name) if art_name else ""
+        json_href = _artifact_json_href(art_name) if art_name else ""
+
         static_rows += (
             "<tr>"
-            f"<td>{m.get('app_name','')}</td>"
-            f"<td><code>{m.get('package','')}</code></td>"
-            f"<td>{m.get('version_name','')} ({m.get('version_code','')})</td>"
-            f"<td><span class='badge sev {sev_badge_class(sev_m)}'>{sev_m}</span></td>"
-            f"<td><span class='badge score {band_m}'>Score: <b>{score_m}</b>/100</span></td>"
-            f"<td class='small'><code>{m.get('artifact_name','')}</code><div class='muted small'>{m.get('artifact_mtime_utc','')}</div></td>"
+            f"<td>{_html_escape(m.get('app_name',''))}</td>"
+            f"<td><code>{_html_escape(m.get('package',''))}</code></td>"
+            f"<td>{_html_escape(m.get('version_name',''))} ({_html_escape(m.get('version_code',''))})</td>"
+            f"<td><span class='badge sev {sev_badge_class(sev_m)}'>{_html_escape(sev_m)}</span></td>"
+            f"<td><span class='badge score {band_m}'>Score: <b>{_html_escape(score_m)}</b>/100</span></td>"
+            f"<td class='small'><code>{_html_escape(art_name)}</code><div class='muted small'>{_html_escape(m.get('artifact_mtime_utc',''))}</div></td>"
+            f"<td class='actions-td'>{_btn(report_href, 'Open Report', 'primary')}</td>"
+            f"<td class='actions-td'>{_btn(json_href, 'Open JSON', 'secondary')}</td>"
             "</tr>"
         )
 
         static_why += (
             "<div class='why-card'>"
-            f"<div class='why-title'>{m.get('app_name','')} <span class='muted'>({m.get('package','')})</span></div>"
+            f"<div class='why-title'>{_html_escape(m.get('app_name',''))} <span class='muted'>({_html_escape(m.get('package',''))})</span></div>"
             f"<div class='why-meta'>"
-            f"<span class='badge sev {sev_badge_class(sev_m)}'>{sev_m}</span>"
-            f"<span class='badge score {band_m}'>Score: <b>{score_m}</b>/100</span>"
-            f"<span class='pill'>Artifact: <code>{m.get('artifact_name','')}</code></span>"
-            f"<span class='pill'>Run: <span class='mono'>{m.get('artifact_mtime_utc','')}</span></span>"
+            f"<span class='badge sev {sev_badge_class(sev_m)}'>{_html_escape(sev_m)}</span>"
+            f"<span class='badge score {band_m}'>Score: <b>{_html_escape(score_m)}</b>/100</span>"
+            f"<span class='pill'>Artifact: <code>{_html_escape(art_name)}</code></span>"
+            f"<span class='pill'>Run: <span class='mono'>{_html_escape(m.get('artifact_mtime_utc',''))}</span></span>"
             f"</div>"
+            f"<div class='why-actions'>{_btn(report_href, 'Open Report')}{_btn(json_href, 'Open JSON', 'secondary')}</div>"
             f"{ref_note}"
             f"{reasons_html}"
             "</div>"
         )
 
     if not static_rows:
-        static_rows = "<tr><td colspan='6'><i>No APK static artifacts found.</i></td></tr>"
+        static_rows = "<tr><td colspan='8'><i>No APK static artifacts found.</i></td></tr>"
     if not static_why:
         static_why = "<i>No static scoring reasons available.</i>"
 
@@ -383,48 +467,61 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
         band_d = _score_band(score_d)
 
         reasons = (d.get("reasons", []) or [])
-        reasons_html = "<ul class='compact'>" + "".join(f"<li>{r}</li>" for r in reasons) + "</ul>"
+        reasons_html = "<ul class='compact'>" + "".join(f"<li>{_html_escape(r)}</li>" for r in reasons) + "</ul>"
 
         unlock_flag = bool(d.get("malicious_unlock", False))
         cap_flag = bool(d.get("benign_cap_applied", False))
 
         ref_note = "<div class='small muted'>"
         parts = []
-        parts.append(f"Conservative score (used): <b>{score_d}</b>/100")
+        parts.append(f"Conservative score (used): <b>{_html_escape(score_d)}</b>/100")
         parts.append(f"Unlock: <b>{'YES' if unlock_flag else 'NO'}</b>")
         parts.append(f"Cap applied: <b>{'YES' if cap_flag else 'NO'}</b>")
         ref_note += " • ".join(parts) + "</div>"
 
+        art_name = str(d.get("artifact_name", ""))
+        report_href = _pick_existing_report_href(reports_dir, art_name) if art_name else ""
+        json_href = _artifact_json_href(art_name) if art_name else ""
+
         dyn_rows += (
             "<tr>"
-            f"<td>{(d.get('app_name') or '')}</td>"
-            f"<td><code>{d.get('package','')}</code></td>"
-            f"<td class='small'>tag=<code>{d.get('tag','')}</code><div class='muted small'>{d.get('device_serial','')}</div></td>"
-            f"<td><span class='badge sev {sev_badge_class(sev_d)}'>{sev_d}</span></td>"
-            f"<td><span class='badge score {band_d}'>Score: <b>{score_d}</b>/100</span></td>"
-            f"<td class='small'><code>{d.get('artifact_name','')}</code><div class='muted small'>{d.get('artifact_mtime_utc','')}</div></td>"
+            f"<td>{_html_escape(d.get('app_name') or '')}</td>"
+            f"<td><code>{_html_escape(d.get('package',''))}</code></td>"
+            f"<td class='small'>tag=<code>{_html_escape(d.get('tag',''))}</code><div class='muted small'>{_html_escape(d.get('device_serial',''))}</div></td>"
+            f"<td><span class='badge sev {sev_badge_class(sev_d)}'>{_html_escape(sev_d)}</span></td>"
+            f"<td>"
+            f"  <span class='badge score {band_d}'>Score: <b>{_html_escape(score_d)}</b>/100</span>"
+            f"  <div class='pills-inline'>{_pill_bool('Unlock', unlock_flag)}{_pill_bool('Cap', cap_flag)}</div>"
+            f"</td>"
+            f"<td class='small'><code>{_html_escape(art_name)}</code><div class='muted small'>{_html_escape(d.get('artifact_mtime_utc',''))}</div></td>"
+            f"<td class='actions-td'>{_btn(report_href, 'Open Report', 'primary')}</td>"
+            f"<td class='actions-td'>{_btn(json_href, 'Open JSON', 'secondary')}</td>"
             "</tr>"
         )
 
         dyn_why += (
             "<div class='why-card'>"
-            f"<div class='why-title'>Dynamic run <span class='muted'>({d.get('package','')})</span></div>"
+            f"<div class='why-title'>Dynamic run <span class='muted'>({_html_escape(d.get('package',''))})</span></div>"
             f"<div class='why-meta'>"
-            f"<span class='badge sev {sev_badge_class(sev_d)}'>{sev_d}</span>"
-            f"<span class='badge score {band_d}'>Score: <b>{score_d}</b>/100</span>"
-            f"<span class='pill'>Artifact: <code>{d.get('artifact_name','')}</code></span>"
-            f"<span class='pill'>Run: <span class='mono'>{d.get('artifact_mtime_utc','')}</span></span>"
+            f"<span class='badge sev {sev_badge_class(sev_d)}'>{_html_escape(sev_d)}</span>"
+            f"<span class='badge score {band_d}'>Score: <b>{_html_escape(score_d)}</b>/100</span>"
+            f"{_pill_bool('Unlock', unlock_flag)}"
+            f"{_pill_bool('Cap', cap_flag)}"
+            f"<span class='pill'>Artifact: <code>{_html_escape(art_name)}</code></span>"
+            f"<span class='pill'>Run: <span class='mono'>{_html_escape(d.get('artifact_mtime_utc',''))}</span></span>"
             f"</div>"
+            f"<div class='why-actions'>{_btn(report_href, 'Open Report')}{_btn(json_href, 'Open JSON', 'secondary')}</div>"
             f"{ref_note}"
             f"{reasons_html}"
             "</div>"
         )
 
     if not dyn_rows:
-        dyn_rows = "<tr><td colspan='6'><i>No APK dynamic artifacts found.</i></td></tr>"
+        dyn_rows = "<tr><td colspan='8'><i>No APK dynamic artifacts found.</i></td></tr>"
     if not dyn_why:
         dyn_why = "<i>No dynamic scoring reasons available.</i>"
 
+    # Case-level note about cap/unlock
     cap_note = ""
     if benign_cap and not unlock:
         cap_note = (
@@ -439,17 +536,37 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
             "</div>"
         )
 
+    quick_links = ""
+    if latest_art:
+        quick_links = (
+            "<div class='row' style='margin-top:10px; gap:10px;'>"
+            f"{_btn(latest_report_href, 'Open Latest Report')}"
+            f"{_btn(latest_json_href, 'Open Latest JSON', 'secondary')}"
+            "</div>"
+        )
+
+    # Risk-mode compare links (generate separate files)
+    mode_links = (
+        "<div class='row' style='margin-top:10px; gap:10px;'>"
+        f"{_btn('case_report__latest.html', 'Mode: latest', 'secondary')}"
+        f"{_btn('case_report__max.html', 'Mode: max', 'secondary')}"
+        f"{_btn('case_report__mean.html', 'Mode: mean', 'secondary')}"
+        "</div>"
+    )
+
     html = f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8"/>
-<title>Case Report - {summary['case_id']}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Case Report - {_html_escape(summary['case_id'])}</title>
 <style>
 :root {{
   --bg: #0b1020;
   --border: rgba(255,255,255,0.09);
   --text: rgba(255,255,255,0.92);
   --muted: rgba(255,255,255,0.66);
+  --shadow: 0 12px 40px rgba(0,0,0,0.22);
 }}
 
 body {{
@@ -463,7 +580,7 @@ body {{
 }}
 
 .container {{
-  max-width: 1200px;
+  max-width: 1250px;
   margin: 28px auto;
   padding: 0 18px 40px 18px;
 }}
@@ -478,13 +595,63 @@ h1 {{
   margin-bottom: 18px;
 }}
 
+.topbar {{
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  backdrop-filter: blur(10px);
+  background: linear-gradient(180deg, rgba(11,16,32,0.92), rgba(11,16,32,0.65));
+  border-bottom: 1px solid rgba(255,255,255,0.09);
+}}
+.topbar .inner {{
+  max-width: 1250px;
+  margin: 0 auto;
+  padding: 10px 18px;
+  display:flex;
+  flex-wrap:wrap;
+  gap: 10px;
+  align-items:center;
+  justify-content: space-between;
+}}
+.brand {{
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  gap:10px;
+}}
+.brand .title {{
+  font-weight: 950;
+  letter-spacing: 0.4px;
+}}
+.nav {{
+  display:flex;
+  flex-wrap:wrap;
+  gap: 8px;
+  align-items:center;
+}}
+.nav a {{
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  padding: 8px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.03);
+  color: rgba(255,255,255,0.86);
+  font-weight: 900;
+  text-decoration: none;
+}}
+.nav a:hover {{
+  background: rgba(255,255,255,0.06);
+}}
+
 .card {{
   background: linear-gradient(180deg, rgba(18,24,40,0.86), rgba(12,16,28,0.82));
   border: 1px solid var(--border);
   border-radius: 16px;
   padding: 14px 16px;
   margin: 14px 0;
-  box-shadow: 0 12px 40px rgba(0,0,0,0.22);
+  box-shadow: var(--shadow);
 }}
 
 .row {{
@@ -519,6 +686,24 @@ h1 {{
   color: var(--muted);
   background: rgba(255,255,255,0.04);
   line-height: 1.2;
+}}
+
+.pill-ok {{
+  border-color: rgba(0,255,170,0.22);
+  background: rgba(0,255,170,0.10);
+  color: rgba(140,255,210,0.95);
+}}
+.pill-no {{
+  border-color: rgba(255,255,255,0.12);
+  background: rgba(255,255,255,0.04);
+  color: rgba(255,255,255,0.70);
+}}
+
+.pills-inline {{
+  display:flex;
+  flex-wrap:wrap;
+  gap: 8px;
+  margin-top: 8px;
 }}
 
 .muted {{ color: var(--muted); }}
@@ -564,6 +749,36 @@ th {{
   background: rgba(255,255,255,0.03);
 }}
 
+.actions-td {{
+  white-space: nowrap;
+}}
+
+.btn {{
+  display:inline-flex;
+  align-items:center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,0.14);
+  background: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.92);
+  text-decoration: none;
+  font-weight: 900;
+  letter-spacing: .2px;
+}}
+.btn:hover {{
+  background: rgba(255,255,255,0.08);
+  border-color: rgba(255,255,255,0.22);
+}}
+.btn.ghost {{
+  background: rgba(255,255,255,0.03);
+  border-color: rgba(255,255,255,0.10);
+  color: rgba(255,255,255,0.85);
+}}
+.btn.ghost:hover {{
+  background: rgba(255,255,255,0.06);
+}}
+
 .compact {{
   margin: 8px 0 0 18px;
   padding: 0;
@@ -588,6 +803,12 @@ th {{
   gap: 10px;
   align-items: center;
   margin-bottom: 8px;
+}}
+.why-actions {{
+  display:flex;
+  flex-wrap:wrap;
+  gap: 10px;
+  margin: 10px 0 6px;
 }}
 
 .LOW {{
@@ -640,32 +861,57 @@ th {{
 </style>
 </head>
 <body>
+
+<div class="topbar" id="top">
+  <div class="inner">
+    <div class="brand">
+      <div class="title">CYBERSHADOW • Case Report</div>
+      <span class="pill"><b>Case:</b> <span class="mono">{_html_escape(summary["case_id"])}</span></span>
+      <span class="pill"><b>Mode:</b> <span class="mono">{_html_escape(rm)}</span></span>
+    </div>
+    <div class="nav">
+      <a href="#overview">Overview</a>
+      <a href="#evidence">Evidence</a>
+      <a href="#static">Static</a>
+      <a href="#dynamic">Dynamic</a>
+      <a href="#env">Env</a>
+      <a href="#top">Top</a>
+    </div>
+  </div>
+</div>
+
 <div class="container">
-  <h1>Hybrid Forensic Case Report</h1>
-  <div class="sub">CYBERSHADOW • Case-level aggregation and traceable scoring summary</div>
+  <h1 id="overview">Hybrid Forensic Case Report</h1>
+  <div class="sub">Case-level aggregation and traceable scoring summary</div>
 
   <div class="card">
     <div class="row">
-      <span class="pill"><b>Case ID:</b> {summary['case_id']}</span>
-      <span class="pill"><b>Created:</b> {summary['created_at_utc']}</span>
-      <span class="badge sev {sev_badge_class(sev)}">{sev}</span>
-      <span class="badge score {score_band}">Final Score: <b>{score}</b>/100</span>
-      <span class="pill"><b>Modules:</b> {", ".join(summary["modules_present"]) if summary["modules_present"] else "None"}</span>
-      <span class="pill"><b>Risk mode:</b> <span class="mono">{rm}</span></span>
-      <span class="pill"><b>Latest artifact:</b> <code>{latest_art}</code></span>
-      <span class="pill"><b>Latest kind:</b> <span class="mono">{latest_kind}</span></span>
+      {_pill("Case ID", summary['case_id'])}
+      {_pill("Created", summary['created_at_utc'])}
+      <span class="badge sev {sev_badge_class(sev)}">{_html_escape(sev)}</span>
+      <span class="badge score {score_band}">Final Score: <b>{_html_escape(score)}</b>/100</span>
+      {_pill("Modules", ", ".join(summary["modules_present"]) if summary["modules_present"] else "None")}
+      {_pill("Risk mode", rm)}
+      {_pill_bool("Malicious unlock", unlock)}
+      {_pill_bool("Benign cap", benign_cap)}
+      {_pill("Latest artifact", latest_art)}
+      {_pill("Latest kind", latest_kind)}
     </div>
+
     <div class="small muted" style="margin-top:10px;">
       Latest = verdict from most recent artifact • Max = worst-case across artifacts • Mean = avg(latest static, latest dynamic)
     </div>
+
     {cap_note}
+    {quick_links}
+    {mode_links}
   </div>
 
-  <div class="card">
+  <div class="card" id="evidence">
     <div class="row" style="justify-content:space-between;">
       <div class="row">
         <h2 style="margin:0;">Evidence Registry</h2>
-        <span class="muted">({len(summary['evidence'])} unique item(s))</span>
+        <span class="muted">({_html_escape(len(summary['evidence']))} unique item(s))</span>
       </div>
     </div>
     <table>
@@ -674,14 +920,14 @@ th {{
     </table>
   </div>
 
-  <div class="card">
+  <div class="card" id="static">
     <div class="row">
       <h2 style="margin:0;">APK Static Analysis Summary</h2>
       <span class="muted">(one row per analyzed artifact)</span>
     </div>
     <table>
       <tr>
-        <th>App</th><th>Package</th><th>Version</th><th>Severity</th><th>Score</th><th>Artifact</th>
+        <th>App</th><th>Package</th><th>Version</th><th>Severity</th><th>Score</th><th>Artifact</th><th>Report</th><th>JSON</th>
       </tr>
       {static_rows}
     </table>
@@ -694,14 +940,14 @@ th {{
     {static_why}
   </div>
 
-  <div class="card">
+  <div class="card" id="dynamic">
     <div class="row">
       <h2 style="margin:0;">APK Dynamic Analysis Summary</h2>
       <span class="muted">(artifact scoring is benign-aware)</span>
     </div>
     <table>
       <tr>
-        <th>App</th><th>Package</th><th>Run</th><th>Severity</th><th>Score</th><th>Artifact</th>
+        <th>App</th><th>Package</th><th>Run</th><th>Severity</th><th>Score + Flags</th><th>Artifact</th><th>Report</th><th>JSON</th>
       </tr>
       {dyn_rows}
     </table>
@@ -714,19 +960,30 @@ th {{
     {dyn_why}
   </div>
 
-  <div class="card">
+  <div class="card" id="env">
     <div class="row">
       <h2 style="margin:0;">Reproducibility (Environment)</h2>
       <span class="muted">snapshot used to reproduce the run</span>
     </div>
-    <pre>{json.dumps(summary.get("env",{}), indent=2, ensure_ascii=False)}</pre>
+    <pre>{_html_escape(json.dumps(summary.get("env",{}), indent=2, ensure_ascii=False))}</pre>
   </div>
 
 </div>
 </body>
 </html>
 """
-    out = case_path / "reports" / "case_report.html"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(html, encoding="utf-8")
-    return str(out)
+
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    # Always write mode-specific file
+    out_mode = reports_dir / f"case_report__{rm}.html"
+    out_mode.write_text(html, encoding="utf-8")
+
+    # Convenience: always keep case_report.html as "latest"
+    # (so UI can open a stable path)
+    if rm == "latest":
+        out_default = reports_dir / "case_report.html"
+        out_default.write_text(html, encoding="utf-8")
+        return str(out_default)
+
+    return str(out_mode)

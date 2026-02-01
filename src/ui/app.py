@@ -1,4 +1,3 @@
-# src/ui/app.py
 from __future__ import annotations
 
 import os
@@ -34,6 +33,18 @@ try:
     _ctk_sf.CTkScrollableFrame.check_if_master_is_canvas = _check_if_master_is_canvas_patched
 except Exception:
     pass
+
+# --- FIX: ensure subprocess runs from project root (so `-m src.main` works) ---
+def _project_root_dir() -> str:
+    """
+    app.py is in: <root>/src/ui/app.py
+    so project root = parents[2]
+    """
+    try:
+        return str(Path(__file__).resolve().parents[2])
+    except Exception:
+        # fallback: current working dir
+        return os.getcwd()
 
 
 # ============================================================
@@ -298,6 +309,119 @@ class CyberShadowHub(ctk.CTk):
 
         self.after(60, self._drain)
 
+    # ---------------- Case path helpers ----------------
+    def _case_abs(self) -> str:
+        c = self.case_entry.get().strip()
+        if not c:
+            return ""
+        return os.path.abspath(c)
+
+    def _case_reports_dir(self) -> str:
+        case_abs = self._case_abs()
+        if not case_abs:
+            return ""
+        return os.path.join(case_abs, "reports")
+
+    def _case_artifacts_dir(self) -> str:
+        case_abs = self._case_abs()
+        if not case_abs:
+            return ""
+        return os.path.join(case_abs, "artifacts")
+
+    def _case_report_path(self) -> Optional[str]:
+        rep_dir = self._case_reports_dir()
+        if not rep_dir or not os.path.isdir(rep_dir):
+            return None
+        p = os.path.join(rep_dir, "case_report.html")
+        return p if os.path.exists(p) else None
+
+    # ---------------- Report naming helpers ----------------
+    @staticmethod
+    def _artifact_kind_from_name(name: str) -> str:
+        n = (name or "").lower()
+        if n.startswith("apk_static__"):
+            return "STATIC"
+        if n.startswith("apk_dynamic__"):
+            return "DYNAMIC"
+        return "UNKNOWN"
+
+    @staticmethod
+    def _report_candidates_for_artifact(artifact_filename: str) -> List[str]:
+        """
+        Supports multiple naming conventions:
+          - apk_report__<stem>.html (preferred, new)
+          - apk_dynamic_report__<stem>.html (older)
+          - apk_static_report__<stem>.html (older)
+        Where <stem> is artifact filename without extension (e.g., apk_dynamic__XYZ).
+        """
+        stem = os.path.splitext(artifact_filename)[0]
+        return [
+            f"apk_report__{stem}.html",
+            f"apk_dynamic_report__{stem}.html",
+            f"apk_static_report__{stem}.html",
+        ]
+
+    def _report_for_artifact_path(self, artifact_path: str) -> Optional[str]:
+        if not artifact_path or not os.path.exists(artifact_path):
+            return None
+        rep_dir = self._case_reports_dir()
+        if not rep_dir or not os.path.isdir(rep_dir):
+            return None
+
+        name = os.path.basename(artifact_path)
+        for cand in self._report_candidates_for_artifact(name):
+            fp = os.path.join(rep_dir, cand)
+            if os.path.exists(fp):
+                return fp
+
+        # fallback: newest html in reports
+        return self._latest_report_any()
+
+    def _latest_report_any(self) -> Optional[str]:
+        rep_dir = self._case_reports_dir()
+        if not rep_dir or not os.path.isdir(rep_dir):
+            return None
+        cands = [os.path.join(rep_dir, x) for x in os.listdir(rep_dir) if x.lower().endswith(".html")]
+        if not cands:
+            return None
+        cands.sort(key=lambda fp: os.path.getmtime(fp), reverse=True)
+        return cands[0]
+
+    def _latest_apk_report(self) -> Optional[str]:
+        """
+        Latest per-artifact report (exclude case_report.html if present).
+        """
+        rep_dir = self._case_reports_dir()
+        if not rep_dir or not os.path.isdir(rep_dir):
+            return None
+
+        htmls = []
+        for name in os.listdir(rep_dir):
+            if not name.lower().endswith(".html"):
+                continue
+            if name.lower() == "case_report.html":
+                continue
+            htmls.append(os.path.join(rep_dir, name))
+
+        if not htmls:
+            return None
+        htmls.sort(key=lambda fp: os.path.getmtime(fp), reverse=True)
+        return htmls[0]
+
+    def _open_folder(self, folder_path: str):
+        if not folder_path or not os.path.isdir(folder_path):
+            messagebox.showinfo("Open Folder", "Folder invalid / inexistent.")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(folder_path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", folder_path], check=False)
+            else:
+                subprocess.run(["xdg-open", folder_path], check=False)
+        except Exception as e:
+            messagebox.showerror("Open Folder Error", str(e))
+
     # ---------------- UI ----------------
     def _build_ui(self):
         header = ctk.CTkFrame(self, fg_color="#0B1220", corner_radius=16)
@@ -436,7 +560,7 @@ class CyberShadowHub(ctk.CTk):
 
         container = ctk.CTkFrame(parent, fg_color="#050A14", corner_radius=16)
         container.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-        container.grid_rowconfigure(2, weight=1)
+        container.grid_rowconfigure(3, weight=1)
         container.grid_columnconfigure(0, weight=1)
 
         row = ctk.CTkFrame(container, fg_color="transparent")
@@ -463,8 +587,48 @@ class CyberShadowHub(ctk.CTk):
         )
         self.btn_open_external.grid(row=0, column=2)
 
+        # NEW: quick report actions
+        row_actions = ctk.CTkFrame(container, fg_color="transparent")
+        row_actions.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+        row_actions.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
+
+        self.btn_load_case_report = ctk.CTkButton(
+            row_actions, text="Load Case Report",
+            command=self._load_case_report,
+            fg_color="#0F766E", hover_color="#14B8A6", height=34
+        )
+        self.btn_load_case_report.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+
+        self.btn_load_selected_report = ctk.CTkButton(
+            row_actions, text="Load Selected Artifact Report",
+            command=self._load_selected_artifact_report,
+            fg_color="#1D4ED8", hover_color="#2563EB", height=34
+        )
+        self.btn_load_selected_report.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+
+        self.btn_load_latest_apk_report = ctk.CTkButton(
+            row_actions, text="Load Latest APK Report",
+            command=self._load_latest_apk_report,
+            fg_color="#7C3AED", hover_color="#8B5CF6", height=34
+        )
+        self.btn_load_latest_apk_report.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+
+        self.btn_open_reports_folder = ctk.CTkButton(
+            row_actions, text="Open Reports Folder",
+            command=lambda: self._open_folder(self._case_reports_dir()),
+            fg_color="#334155", hover_color="#475569", height=34
+        )
+        self.btn_open_reports_folder.grid(row=0, column=3, sticky="ew", padx=(0, 8))
+
+        self.btn_open_artifacts_folder = ctk.CTkButton(
+            row_actions, text="Open Artifacts Folder",
+            command=lambda: self._open_folder(self._case_artifacts_dir()),
+            fg_color="#334155", hover_color="#475569", height=34
+        )
+        self.btn_open_artifacts_folder.grid(row=0, column=4, sticky="ew")
+
         row2 = ctk.CTkFrame(container, fg_color="transparent")
-        row2.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+        row2.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
         row2.grid_columnconfigure(0, weight=1)
 
         self.viewer_bright_var = ctk.BooleanVar(value=True)
@@ -482,12 +646,12 @@ class CyberShadowHub(ctk.CTk):
             horizontal_scrollbar="auto",
             messages_enabled=False
         )
-        self.html_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.html_frame.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 10))
 
         self.html_frame.load_html(
             "<html><body style='background:#0b1020;color:#E5E7EB;font-family:Arial;padding:20px;'>"
             "<h2>Report Viewer</h2><p>No report loaded yet.</p>"
-            "<p>Run an analysis, then click <b>LOAD REPORT INTO VIEWER</b>.</p>"
+            "<p>Run an analysis, then click <b>LOAD REPORT INTO VIEWER</b> or use the quick buttons above.</p>"
             "</body></html>"
         )
 
@@ -603,7 +767,7 @@ class CyberShadowHub(ctk.CTk):
         self.tag_entry.grid(row=7, column=0, sticky="ew", pady=(0, 10))
         self.tag_entry.insert(0, "run1")
 
-        # ---- Load report button
+        # ---- Load report button (kept for backward UX)
         self.btn_load_report = ctk.CTkButton(
             scroll, text="LOAD REPORT INTO VIEWER", command=self._load_report_into_viewer,
             fg_color="#0F766E", hover_color="#14B8A6", height=38,
@@ -867,18 +1031,9 @@ class CyberShadowHub(ctk.CTk):
             justify="left"
         ).pack(anchor="w")
 
-    def _case_abs(self) -> str:
-        c = self.case_entry.get().strip()
-        if not c:
-            return ""
-        return os.path.abspath(c)
-
     def _artifact_paths(self) -> List[str]:
-        case_abs = self._case_abs()
-        if not case_abs or not os.path.isdir(case_abs):
-            return []
-        art_dir = os.path.join(case_abs, "artifacts")
-        if not os.path.isdir(art_dir):
+        art_dir = self._case_artifacts_dir()
+        if not art_dir or not os.path.isdir(art_dir):
             return []
 
         paths: List[str] = []
@@ -888,15 +1043,6 @@ class CyberShadowHub(ctk.CTk):
 
         paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         return paths
-
-    @staticmethod
-    def _artifact_kind_from_name(name: str) -> str:
-        n = (name or "").lower()
-        if n.startswith("apk_static__"):
-            return "STATIC"
-        if n.startswith("apk_dynamic__"):
-            return "DYNAMIC"
-        return "UNKNOWN"
 
     def _ensure_artifact_trace(self):
         if self._artifact_trace_attached:
@@ -928,6 +1074,15 @@ class CyberShadowHub(ctk.CTk):
         if hasattr(self, "artifacts_count_label"):
             self.artifacts_count_label.configure(text=f"{len(paths)} items")
 
+        # enable/disable quick buttons depending on folders existing
+        try:
+            rep_dir = self._case_reports_dir()
+            art_dir = self._case_artifacts_dir()
+            self.btn_open_reports_folder.configure(state="normal" if rep_dir and os.path.isdir(rep_dir) else "disabled")
+            self.btn_open_artifacts_folder.configure(state="normal" if art_dir and os.path.isdir(art_dir) else "disabled")
+        except Exception:
+            pass
+
         if not paths:
             ctk.CTkLabel(
                 self.art_scroll,
@@ -938,6 +1093,7 @@ class CyberShadowHub(ctk.CTk):
             self._selected_artifact_path = None
             self._selected_preview_lines = ["== SELECTED ARTIFACT PREVIEW ==", "(none)"]
             self._render_summary()
+            self._update_report_buttons_state()
             return
 
         for p in paths:
@@ -959,6 +1115,42 @@ class CyberShadowHub(ctk.CTk):
             self._selected_artifact_path = paths[0]
 
         self._update_selected_artifact_preview()
+        self._update_report_buttons_state()
+
+    def _update_report_buttons_state(self):
+        """
+        Keeps UX snappy: enable buttons when corresponding targets exist.
+        """
+        try:
+            # Case report button
+            cr = self._case_report_path()
+            self.btn_load_case_report.configure(state="normal" if cr else "disabled")
+        except Exception:
+            pass
+
+        try:
+            # Selected artifact report
+            sel = self._selected_artifact_path or self._artifact_radio_var.get().strip()
+            rp = self._report_for_artifact_path(sel) if sel else None
+            self.btn_load_selected_report.configure(state="normal" if rp else "disabled")
+        except Exception:
+            pass
+
+        try:
+            # Latest APK report
+            lr = self._latest_apk_report()
+            self.btn_load_latest_apk_report.configure(state="normal" if lr else "disabled")
+        except Exception:
+            pass
+
+        try:
+            # Legacy "LOAD REPORT INTO VIEWER" button on APK tab
+            if self._case_report_path() or self._latest_report_any() or (self._selected_artifact_path and self._report_for_artifact_path(self._selected_artifact_path)):
+                self.btn_load_report.configure(state="normal")
+            else:
+                self.btn_load_report.configure(state="disabled")
+        except Exception:
+            pass
 
     def _read_artifact_meta(self, artifact_path: str) -> str:
         try:
@@ -1046,6 +1238,7 @@ class CyberShadowHub(ctk.CTk):
         if not p or not os.path.exists(p):
             self._selected_preview_lines = ["== SELECTED ARTIFACT PREVIEW ==", "(none)"]
             self._render_summary()
+            self._update_report_buttons_state()
             return
 
         obj = self._read_json_safe(p)
@@ -1089,6 +1282,14 @@ class CyberShadowHub(ctk.CTk):
         lines.append(f"Derived severity: {sev20}")
         lines.append(f"Raw score (artifact): {score100}/100")
 
+        # show report hints (polish)
+        cr = self._case_report_path()
+        ar = self._report_for_artifact_path(p)
+        lines.append("")
+        lines.append("== REPORT HINTS ==")
+        lines.append(f"Case Report: {cr if cr else '(missing)'}")
+        lines.append(f"Selected Artifact Report: {ar if ar else '(missing)'}")
+
         lines.append("")
         lines.append("== TOP REASONS ==")
         if top:
@@ -1120,8 +1321,7 @@ class CyberShadowHub(ctk.CTk):
         if self._proc is None:
             self._set_badges(score100, None)
 
-        if self._find_report_for_selected_artifact() or self._parser.summary.best_report_path():
-            self.btn_load_report.configure(state="normal")
+        self._update_report_buttons_state()
 
     def _render_summary(self):
         blocks: List[str] = []
@@ -1234,16 +1434,25 @@ class CyberShadowHub(ctk.CTk):
                 self.btn_load_report.configure(state="disabled")
         except Exception:
             pass
+        try:
+            if running:
+                self.btn_load_case_report.configure(state="disabled")
+                self.btn_load_selected_report.configure(state="disabled")
+                self.btn_load_latest_apk_report.configure(state="disabled")
+        except Exception:
+            pass
 
     def _augment_env_for_tools(self, env: Dict[str, str]) -> Dict[str, str]:
         env = dict(env or {})
         path = env.get("PATH", "")
 
+        # Ensure python exe dir is on PATH (helps if launched from shortcuts)
         exe_dir = os.path.dirname(sys.executable)
         if exe_dir and os.path.isdir(exe_dir):
             if exe_dir not in path:
                 path = exe_dir + os.pathsep + path
 
+        # Guess ADB on Windows
         local = os.environ.get("LOCALAPPDATA", "")
         guess_adb = os.path.join(local, "Android", "Sdk", "platform-tools")
         if guess_adb and os.path.isdir(guess_adb):
@@ -1251,6 +1460,16 @@ class CyberShadowHub(ctk.CTk):
                 path = guess_adb + os.pathsep + path
 
         env["PATH"] = path
+
+        # --- IMPORTANT: make sure `python -m src.main` can import src ---
+        root = _project_root_dir()
+        cur_pp = env.get("PYTHONPATH", "")
+        if cur_pp:
+            if root not in cur_pp.split(os.pathsep):
+                env["PYTHONPATH"] = root + os.pathsep + cur_pp
+        else:
+            env["PYTHONPATH"] = root
+
         return env
 
     def _run_apk(self):
@@ -1384,11 +1603,10 @@ class CyberShadowHub(ctk.CTk):
             cmd_dyn.extend(["--serial", serial])
 
         # optional seed-url (if your frida_auto supports it)
-        # keep it safe: only add if non-empty
         if seed_url:
             cmd_dyn.extend(["--seed-url", seed_url, "--seed-repeat", str(seed_repeat), "--seed-interval", str(seed_interval)])
 
-        # 2) generate case-report after dynamic run (so you can view it)
+        # 2) generate case-report after dynamic run
         cmd_case = [
             py, "-m", "src.main",
             "case-report",
@@ -1428,8 +1646,11 @@ class CyberShadowHub(ctk.CTk):
                     text=True,
                     bufsize=1,
                     universal_newlines=True,
-                    env=env
+                    env=env,
+                    cwd=_project_root_dir()  # <-- FIX: run from repo root
                 )
+
+
 
                 assert self._proc.stdout is not None
                 for line in self._proc.stdout:
@@ -1446,11 +1667,9 @@ class CyberShadowHub(ctk.CTk):
                 if rc is not None:
                     self._parser.summary.return_code = rc
 
-                # separator between stages
                 self._q.put("\n")
 
                 if rc not in (0, None) and idx == 0:
-                    # if first command fails, stop pipeline
                     break
 
         except FileNotFoundError as e:
@@ -1501,12 +1720,6 @@ class CyberShadowHub(ctk.CTk):
             else:
                 self._set_status(f"Finished (rc={rc})")
 
-        if self._parser.summary.best_report_path() or self._find_report_for_selected_artifact():
-            try:
-                self.btn_load_report.configure(state="normal")
-            except Exception:
-                pass
-
         self._refresh_live(force=True)
         self._refresh_artifacts()
 
@@ -1550,58 +1763,62 @@ class CyberShadowHub(ctk.CTk):
         self._run_summary_lines = lines
         self._render_summary()
 
-    # ---------------- Report selection logic ----------------
+    # ---------------- Report loading (polished) ----------------
     def _find_report_for_selected_artifact(self) -> Optional[str]:
-        p = self._selected_artifact_path or self._artifact_radio_var.get().strip()
-        if not p or not os.path.exists(p):
-            return None
-
-        case_abs = self._case_abs()
-        if not case_abs:
-            return None
-
-        rep_dir = os.path.join(case_abs, "reports")
-        if not os.path.isdir(rep_dir):
-            return None
-
-        # Prefer case_report.html always (if exists)
-        cr = os.path.join(rep_dir, "case_report.html")
-        if os.path.exists(cr):
+        # Prefer case_report always if exists
+        cr = self._case_report_path()
+        if cr:
             return cr
 
-        name = os.path.basename(p)
-        kind = self._artifact_kind_from_name(name)
+        sel = self._selected_artifact_path or self._artifact_radio_var.get().strip()
+        if sel:
+            rp = self._report_for_artifact_path(sel)
+            if rp:
+                return rp
 
-        if kind == "STATIC":
-            stem = os.path.splitext(name)[0]
-            candidate = os.path.join(rep_dir, f"apk_report__{stem}.html")
-            if os.path.exists(candidate):
-                return candidate
+        # fallback: parser suggests something
+        p = self._parser.summary.best_report_path()
+        if p and os.path.exists(p):
+            return p
 
-        if kind == "DYNAMIC":
-            stem = os.path.splitext(name)[0]
-            cand1 = os.path.join(rep_dir, f"apk_dynamic_report__{stem}.html")
-            if os.path.exists(cand1):
-                return cand1
-
-        cands = [os.path.join(rep_dir, x) for x in os.listdir(rep_dir) if x.lower().endswith(".html")]
-        cands.sort(key=lambda fp: os.path.getmtime(fp), reverse=True)
-        return cands[0] if cands else None
+        return self._latest_report_any()
 
     def _load_report_into_viewer(self):
+        # legacy button behavior: best available report
         p = self._find_report_for_selected_artifact()
-        if not p:
-            p = self._parser.summary.best_report_path()
-
         if not p:
             messagebox.showinfo("Report", "Nu am găsit un report HTML valid încă.")
             return
-
         try:
             self._set_report(p)
             self.right_tabs.set("Report Viewer")
         except Exception as e:
             messagebox.showerror("Report Viewer Error", str(e))
+
+    def _load_case_report(self):
+        p = self._case_report_path()
+        if not p:
+            messagebox.showinfo("Case Report", "case_report.html nu există încă (rulează o analiză / generează case report).")
+            return
+        self._set_report(p)
+        self.right_tabs.set("Report Viewer")
+
+    def _load_selected_artifact_report(self):
+        sel = self._selected_artifact_path or self._artifact_radio_var.get().strip()
+        p = self._report_for_artifact_path(sel) if sel else None
+        if not p:
+            messagebox.showinfo("Selected Artifact Report", "Nu am găsit raport pentru artifact-ul selectat.")
+            return
+        self._set_report(p)
+        self.right_tabs.set("Report Viewer")
+
+    def _load_latest_apk_report(self):
+        p = self._latest_apk_report()
+        if not p:
+            messagebox.showinfo("Latest APK Report", "Nu am găsit rapoarte APK (în afară de case_report.html).")
+            return
+        self._set_report(p)
+        self.right_tabs.set("Report Viewer")
 
     def _set_report(self, path: str):
         path = os.path.abspath(path)
@@ -1618,20 +1835,20 @@ class CyberShadowHub(ctk.CTk):
         self.html_frame.load_html(html)
 
     def _reload_report(self):
-        p = self._report_path or self._find_report_for_selected_artifact() or self._parser.summary.best_report_path()
+        p = self._report_path or self._find_report_for_selected_artifact()
         if not p or not os.path.exists(p):
             messagebox.showinfo("Reload", "Nu există report detectat încă.")
             return
         self._set_report(p)
 
     def _open_report_external(self):
-        p = self._report_path or self._find_report_for_selected_artifact() or self._parser.summary.best_report_path()
+        p = self._report_path or self._find_report_for_selected_artifact()
         if not p or not os.path.exists(p):
             messagebox.showinfo("Open", "Nu există report detectat încă.")
             return
         try:
             import webbrowser
-            uri = Path(p).absolute().as_uri()  # safest on Windows (spaces etc)
+            uri = Path(p).absolute().as_uri()
             webbrowser.open(uri)
         except Exception as e:
             messagebox.showerror("Open External Error", str(e))
@@ -1714,7 +1931,7 @@ def inject_viewer_override_css(html: str) -> str:
   a { color: #93C5FD !important; }
   .row, .why-meta { display: block !important; }
   .pill, .badge {
-    display: inline-block !important;
+    display: inline-block;  /* <-- Am scos !important */
     margin: 6px 10px 0 0 !important;
     vertical-align: middle !important;
     border: 1px solid rgba(255,255,255,0.12) !important;
