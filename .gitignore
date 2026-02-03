@@ -13,7 +13,11 @@ venv/
 artifacts/
 cases/
 inputs/
-
+media_deepfake_try/
+dbg_real/
+dbg_fake/
+models/
+reports/
 # Logs / temp
 *.log
 *.tmp

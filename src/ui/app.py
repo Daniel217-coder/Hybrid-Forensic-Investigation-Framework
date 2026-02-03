@@ -15,6 +15,7 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
 from tkinterweb import HtmlFrame
+from .deepfake_ui import build_deepfake_image_tab, build_deepfake_video_tab
 
 # --- FIX: CustomTkinter mousewheel event.widget can be a string (Tk path) ---
 try:
@@ -517,8 +518,10 @@ class CyberShadowHub(ctk.CTk):
 
         self._build_apk_controls(self.tab_apk)
         self._build_dynamic_controls(self.tab_dyn)
-        self._build_placeholder(self.tab_img, "Deepfake Detector (Image)")
-        self._build_placeholder(self.tab_vid, "Deepfake Detector (Video)")
+        build_deepfake_image_tab(self, self.tab_img)
+        build_deepfake_video_tab(self, self.tab_vid)
+
+
 
         # Right: Tabs (Log / Summary / Report Viewer)
         right = ctk.CTkFrame(body, fg_color="#0B1220", corner_radius=16)
