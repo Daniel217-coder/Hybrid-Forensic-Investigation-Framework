@@ -13,7 +13,7 @@ from typing import Optional, Dict, List, Tuple, Any
 import time
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
-
+from src.vt_routes import router as vt_router
 from tkinterweb import HtmlFrame
 from .deepfake_ui import build_deepfake_image_tab, build_deepfake_video_tab
 
@@ -450,6 +450,8 @@ class CyberShadowHub(ctk.CTk):
             return "MEMLITE"
         if n.startswith("risk_aggregate__") or n.startswith("risk__") or n.startswith("risk_aggregate"):
             return "RISK"
+        if n.startswith("vt__"):
+            return "VT"
         return "UNKNOWN"
 
     @staticmethod
@@ -869,6 +871,16 @@ class CyberShadowHub(ctk.CTk):
         )
         self.btn_uninstall_pkg.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
 
+        self.btn_vt_enrich = ctk.CTkButton(
+            action2,
+            text="VirusTotal Enrich",
+            command=self._vt_enrich_case,
+            fg_color="#0F172A",
+            hover_color="#1F2937",
+            height=38,
+            font=ctk.CTkFont(size=13, weight="bold")
+        )
+        self.btn_vt_enrich.grid(row=1, column=2, sticky="ew", padx=(0, 8), pady=(8, 0))
 
 
         # ---- Case Folder
@@ -1318,6 +1330,7 @@ class CyberShadowHub(ctk.CTk):
                 or name.startswith("yara__")
                 or name.startswith("memlite__")
                 or name.startswith("risk_aggregate__")
+                or name.startswith("vt__")
             ):
                 paths.append(os.path.join(art_dir, name))
 
@@ -2135,6 +2148,7 @@ class CyberShadowHub(ctk.CTk):
     
 
     def _http_post_json(self, url: str, payload: dict, timeout: int = 30) -> dict:
+        import urllib.error
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url,
@@ -2142,8 +2156,19 @@ class CyberShadowHub(ctk.CTk):
             method="POST",
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", errors="replace"))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            # FastAPI de obicei răspunde cu {"detail": "..."}
+            try:
+                j = json.loads(body) if body else {}
+            except Exception:
+                j = {"detail": body or str(e)}
+            j["_http_status"] = getattr(e, "code", None)
+            return j
+
 
     def _poll_job_until_done(self, job_id: str, timeout_sec: int = 600, tick_sec: float = 0.6) -> dict:
         t0 = time.time()
@@ -2252,6 +2277,62 @@ class CyberShadowHub(ctk.CTk):
                 self._q.put("[UI] __RUN_FINISHED__\n")
             except Exception as e:
                 self._q.put(f"[ERROR] {e}\n")
+                self._q.put("[UI] __RUN_FINISHED__\n")
+
+        self._set_status("Running…")
+        self._progress_running(True)
+        self._set_running_ui(True)
+        threading.Thread(target=worker, daemon=True).start()
+
+
+    def _vt_enrich_case(self):
+        """
+        Calls POST /vt/enrich (sync) in a worker thread, saves vt__*.json in case artifacts,
+        refreshes UI and prints summary in Quick Summary.
+        """
+        case_folder = self.case_entry.get().strip()
+        apk_path = self.apk_entry.get().strip()
+        tag = (self.tag_entry.get().strip() or "run1")
+
+        if not case_folder:
+            messagebox.showerror("VirusTotal", "Case Folder este gol.")
+            return
+
+        # prefer apk_path if present; else user can rely on sha256 in future
+        if apk_path and not os.path.exists(apk_path):
+            messagebox.showerror("VirusTotal", "APK path nu există.")
+            return
+
+        payload = {
+            "case_dir": case_folder,
+            "apk_path": apk_path if apk_path else None,
+            "sha256": None,
+            "tag": tag,
+        }
+
+        def worker():
+            try:
+                self._q.put("------------------------------------------------------------\n")
+                self._q.put("[UI] VirusTotal: POST /vt/enrich ...\n")
+                self._q.put(f"[UI] Payload: {json.dumps(payload)}\n")
+
+                res = self._http_post_json(self._api_base() + "/vt/enrich", payload, timeout=180)
+                if not isinstance(res, dict) or not res.get("ok"):
+                    raise RuntimeError(f"vt_enrich_bad_response: {res}")
+
+                result = res.get("result") or {}
+                self._q.put("[OK] VirusTotal enrich DONE\n")
+                self._q.put(json.dumps(result, indent=2) + "\n")
+
+                # optional: if vt_enrich returns artifact path, auto-select it
+                art = result.get("artifact") or result.get("artifact_path") or ""
+                if art:
+                    self._q.put(f"[VT] artifact: {art}\n")
+
+                self._q.put("[UI] __RUN_FINISHED__\n")
+
+            except Exception as e:
+                self._q.put(f"[ERROR] VirusTotal enrich failed: {e}\n")
                 self._q.put("[UI] __RUN_FINISHED__\n")
 
         self._set_status("Running…")
@@ -2403,6 +2484,34 @@ class CyberShadowHub(ctk.CTk):
 
     # ---------------- Report loading (polished) ----------------
     def _find_report_for_selected_artifact(self) -> Optional[str]:
+        """
+        Legacy button behavior: load the most relevant report for current context.
+        Priority:
+        1) Selected artifact report (if any)
+        2) Case report
+        3) Parser suggested HTML
+        4) Latest HTML in reports
+        """
+        sel = self._selected_artifact_path or self._artifact_radio_var.get().strip()
+        if sel:
+            rp = self._report_for_artifact_path(sel)
+            if rp and os.path.exists(rp):
+                return rp
+
+        cr = self._case_report_path()
+        if cr and os.path.exists(cr):
+            return cr
+
+        p = self._parser.summary.best_report_path()
+        if p and os.path.exists(p):
+            return p
+
+        p2 = self._latest_report_any()
+        if p2 and os.path.exists(p2):
+            return p2
+
+        return None
+
         # Prefer case_report always if exists
         cr = self._case_report_path()
         if cr:
@@ -2442,6 +2551,126 @@ class CyberShadowHub(ctk.CTk):
         except Exception as e:
             messagebox.showerror("Report Viewer Error", str(e))
 
+
+    def _extract_score_sev_from_html(self, html: str) -> Tuple[Optional[int], Optional[str]]:
+        """
+        Best-effort parse score/severity from HTML text.
+        Works for patterns like:
+        - "Score: 19/100"
+        - "Final Score: 19/100"
+        - "Severity: LOW"
+        """
+        if not html:
+            return (None, None)
+
+        rx_score = re.compile(r"(?:Final\s+Score|Score)\s*:\s*(\d{1,3})\s*/\s*100", re.IGNORECASE)
+        rx_sev = re.compile(r"Severity\s*:\s*([A-Z]+)", re.IGNORECASE)
+
+        score = None
+        sev = None
+
+        m = rx_score.search(html)
+        if m:
+            try:
+                score = clamp_int(int(m.group(1)), 0, 100)
+            except Exception:
+                score = None
+
+        m = rx_sev.search(html)
+        if m:
+            sev = (m.group(1) or "").upper().strip() or None
+
+        return (score, sev)
+
+
+    def _artifact_json_from_report_path(self, report_path: str) -> Optional[str]:
+        """
+        Map report HTML back to artifact JSON, based on your report naming:
+        reports/apk_report__<artifact_stem>.html
+        artifact JSON is usually:
+        artifacts/<artifact_stem>.json
+        """
+        try:
+            report_path = os.path.abspath(report_path)
+            name = os.path.basename(report_path)
+
+            rep_dir = self._case_reports_dir()
+            art_dir = self._case_artifacts_dir()
+            if not rep_dir or not art_dir:
+                return None
+
+            if not name.lower().endswith(".html"):
+                return None
+
+            # preferred: apk_report__<stem>.html
+            if name.startswith("apk_report__"):
+                stem = name[len("apk_report__"):-len(".html")]
+                cand = os.path.join(art_dir, stem + ".json")
+                if os.path.exists(cand):
+                    return cand
+
+            # older: apk_dynamic_report__<stem>.html / apk_static_report__<stem>.html
+            for pref in ("apk_dynamic_report__", "apk_static_report__"):
+                if name.startswith(pref):
+                    stem = name[len(pref):-len(".html")]
+                    cand = os.path.join(art_dir, stem + ".json")
+                    if os.path.exists(cand):
+                        return cand
+
+        except Exception:
+            pass
+
+        return None
+
+
+    def _sync_badges_after_report_load(self, report_path: str, loaded_html: Optional[str] = None):
+        """
+        After loading a report in viewer, sync top badges to match THAT report.
+        Priority:
+        1) If report maps to artifact JSON => read score from JSON (most reliable)
+        2) Else parse score/severity from HTML
+        3) Else fallback to latest risk aggregate artifact
+        """
+        # 1) artifact JSON mapping
+        try:
+            aj = self._artifact_json_from_report_path(report_path)
+            if aj and os.path.exists(aj):
+                obj = self._read_json_safe(aj)
+                score100 = self._extract_score_0_100(obj)
+                self._set_badges(score100, None)
+                return
+        except Exception:
+            pass
+
+        # 2) parse HTML
+        try:
+            html = loaded_html or ""
+            score, _sev = self._extract_score_sev_from_html(html)
+            if score is not None:
+                self._set_badges(score, None)
+                return
+        except Exception:
+            pass
+
+        # 3) fallback: newest risk_aggregate__*.json
+        try:
+            art_dir = self._case_artifacts_dir()
+            if art_dir and os.path.isdir(art_dir):
+                risks = [
+                    os.path.join(art_dir, n)
+                    for n in os.listdir(art_dir)
+                    if n.startswith("risk_aggregate__") and n.endswith(".json")
+                ]
+                risks.sort(key=lambda fp: os.path.getmtime(fp), reverse=True)
+                if risks:
+                    obj = self._read_json_safe(risks[0])
+                    score100 = self._extract_score_0_100(obj)
+                    self._set_badges(score100, None)
+                    return
+        except Exception:
+            pass
+        
+
     def _load_case_report(self):
         p = self._case_report_path()
         if not p:
@@ -2468,6 +2697,25 @@ class CyberShadowHub(ctk.CTk):
         self.right_tabs.set("Report Viewer")
 
     def _set_report(self, path: str):
+        path = os.path.abspath(path)
+        self._report_path = path
+        self.report_path_label.configure(text=f"Report: {path}")
+
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            html = f.read()
+
+        viewer_on = bool(getattr(self, "viewer_bright_var", None) and self.viewer_bright_var.get())
+        if viewer_on:
+            html = inject_viewer_override_css(html)
+
+        self.html_frame.load_html(html)
+
+        # NEW: sync badges to the report you just loaded
+        try:
+            self._sync_badges_after_report_load(path, loaded_html=html)
+        except Exception:
+            pass
+
         path = os.path.abspath(path)
         self._report_path = path
         self.report_path_label.configure(text=f"Report: {path}")

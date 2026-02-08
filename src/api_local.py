@@ -14,12 +14,13 @@ import re
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, field_validator
-
+from src.vt_routes import router as vt_router
 from src.case_manager import new_case, add_evidence, save_artifact
 from src.apk_static import analyze_apk, set_verbose
 from src.report_html import generate_apk_html_report
 from src.case_report import write_case_html
 from src.env_report import get_versions
+from src.vt_routes import router as vt_router
 
 # ADB-only dynamic (NO FRIDA REQUIRED)
 from src.apk_dynamic import run_dynamic as run_dynamic_adb  # <- important
@@ -336,6 +337,8 @@ def run_dynamic_frida_endpoint(req: RunDynamicFridaReq):
 
 from src.devices_api import router as devices_router
 app.include_router(devices_router)
+app.include_router(vt_router)
+
 
 # ==========================================================
 # EXTRA: Repack + Install workflow (Frida Gadget) + Uninstall

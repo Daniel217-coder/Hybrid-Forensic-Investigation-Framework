@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from datetime import datetime
-from typing import Literal, Any
+from typing import Literal, Any, Optional
 
 RiskMode = Literal["latest", "max", "mean"]
 
@@ -12,7 +12,10 @@ RiskMode = Literal["latest", "max", "mean"]
 # --------------------------- IO helpers ---------------------------
 
 def _load_json(p: Path) -> dict:
-    return json.loads(p.read_text(encoding="utf-8"))
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 def _fmt_ts(unix_ts: float) -> str:
@@ -36,6 +39,13 @@ def _safe_int(x: Any, default: int = 0) -> int:
         return default
 
 
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
 def _clamp(n: int, lo: int = 0, hi: int = 100) -> int:
     try:
         n = int(n)
@@ -49,7 +59,6 @@ def _clamp(n: int, lo: int = 0, hi: int = 100) -> int:
 
 
 def _escape(s: Any) -> str:
-    # minimal HTML escape
     if s is None:
         return ""
     s = str(s)
@@ -65,8 +74,6 @@ def _escape(s: Any) -> str:
 # --------------------------- scoring helpers ---------------------------
 
 def _score_band(score: int) -> str:
-    # UI thresholds requested:
-    # green <20, yellow <50, orange <75, red >=75 (<=100)
     s = _safe_int(score, 0)
     if s < 20:
         return "SCORE_GREEN"
@@ -92,7 +99,7 @@ def sev_badge_class(sev: str) -> str:
 
 def _normalize_static(obj: dict, artifact_name: str, artifact_path: Path) -> dict:
     scoring = (obj.get("scoring") or {})
-    out = {
+    return {
         "artifact_name": artifact_name,
         "artifact_path": str(artifact_path),
         "artifact_mtime_utc": _fmt_fs_ts_mtime(artifact_path),
@@ -103,12 +110,11 @@ def _normalize_static(obj: dict, artifact_name: str, artifact_path: Path) -> dic
         "score": _safe_int(scoring.get("score", 0), 0),
         "reasons": scoring.get("reasons", []) or [],
     }
-    return out
 
 
 def _normalize_dynamic(obj: dict, artifact_name: str, artifact_path: Path) -> dict:
     scoring = (obj.get("scoring") or {})
-    out = {
+    return {
         "artifact_name": artifact_name,
         "artifact_path": str(artifact_path),
         "artifact_mtime_utc": _fmt_fs_ts_mtime(artifact_path),
@@ -122,13 +128,12 @@ def _normalize_dynamic(obj: dict, artifact_name: str, artifact_path: Path) -> di
         "events": obj.get("events", {}) or {},
         "iocs": obj.get("iocs", {}) or {},
     }
-    return out
 
 
 def _normalize_yara(obj: dict, artifact_name: str, artifact_path: Path) -> dict:
     scoring = (obj.get("scoring") or {})
     matches = obj.get("matches", obj.get("results", obj.get("rules", [])))
-    out = {
+    return {
         "artifact_name": artifact_name,
         "artifact_path": str(artifact_path),
         "artifact_mtime_utc": _fmt_fs_ts_mtime(artifact_path),
@@ -140,18 +145,9 @@ def _normalize_yara(obj: dict, artifact_name: str, artifact_path: Path) -> dict:
         "matches": matches,
         "malicious_unlock": bool(scoring.get("malicious_unlock", obj.get("malicious_unlock", False))),
     }
-    return out
 
 
 def _normalize_yara_matches(matches) -> list[dict]:
-    """Coerce YARA match output into list[dict] so templates can slice safely.
-
-    Accepts:
-      - list[dict] (preferred)
-      - list[str]
-      - dict with a 'matches' / 'rules' / 'results' list
-      - dict mapping rule_name -> meta
-    """
     if not matches:
         return []
     if isinstance(matches, list):
@@ -181,7 +177,7 @@ def _normalize_yara_matches(matches) -> list[dict]:
 
 def _normalize_memlite(obj: dict, artifact_name: str, artifact_path: Path) -> dict:
     scoring = (obj.get("scoring") or {})
-    out = {
+    return {
         "artifact_name": artifact_name,
         "artifact_path": str(artifact_path),
         "artifact_mtime_utc": _fmt_fs_ts_mtime(artifact_path),
@@ -193,7 +189,42 @@ def _normalize_memlite(obj: dict, artifact_name: str, artifact_path: Path) -> di
         "reasons": scoring.get("reasons", []) or [],
         "extras": obj.get("extras", {}) or {},
     }
-    return out
+
+
+def _normalize_vt(obj: dict, artifact_name: str, artifact_path: Path) -> dict:
+    stats = obj.get("stats") if isinstance(obj.get("stats"), dict) else {}
+    malicious = _safe_int(stats.get("malicious"), 0)
+    suspicious = _safe_int(stats.get("suspicious"), 0)
+    total = _safe_int(stats.get("total"), 0)
+    positives = _safe_int(stats.get("positives"), malicious + suspicious)
+    vt_score = _safe_int(obj.get("vt_score"), 0)
+    confidence = _safe_float(obj.get("confidence"), 0.0)
+    if confidence < 0:
+        confidence = 0.0
+    if confidence > 1:
+        confidence = 1.0
+    return {
+        "artifact_name": artifact_name,
+        "artifact_path": str(artifact_path),
+        "artifact_mtime_utc": _fmt_fs_ts_mtime(artifact_path),
+        "module": "virustotal",
+        "sha256": obj.get("sha256", ""),
+        "found": bool(obj.get("found", False)),
+        "vt_score": vt_score,
+        "confidence": confidence,
+        "stats": {
+            "malicious": malicious,
+            "suspicious": suspicious,
+            "undetected": _safe_int(stats.get("undetected"), 0),
+            "harmless": _safe_int(stats.get("harmless"), 0),
+            "timeout": _safe_int(stats.get("timeout"), 0),
+            "total": total,
+            "positives": positives,
+        },
+        "gui_url": obj.get("gui_url", ""),
+        "apk_path": obj.get("apk_path", ""),
+        "tag": obj.get("tag", ""),
+    }
 
 
 def _latest_by_mtime(items: list[dict]) -> dict | None:
@@ -202,16 +233,16 @@ def _latest_by_mtime(items: list[dict]) -> dict | None:
     return sorted(items, key=lambda x: str(x.get("artifact_mtime_utc", "")), reverse=True)[0]
 
 
-def _max_by_score(items: list[dict]) -> dict | None:
+def _max_by_score(items: list[dict], score_key: str = "score") -> dict | None:
     if not items:
         return None
-    return sorted(items, key=lambda x: _safe_int(x.get("score", 0), 0), reverse=True)[0]
+    return sorted(items, key=lambda x: _safe_int(x.get(score_key, 0), 0), reverse=True)[0]
 
 
-def _mean_score(items: list[dict]) -> int:
+def _mean_score(items: list[dict], score_key: str = "score") -> int:
     if not items:
         return 0
-    vals = [_safe_int(x.get("score", 0), 0) for x in items]
+    vals = [_safe_int(x.get(score_key, 0), 0) for x in items]
     if not vals:
         return 0
     return int(round(sum(vals) / len(vals)))
@@ -221,8 +252,17 @@ def _pick_mode(items: list[dict], mode: RiskMode) -> dict | None:
     if mode == "latest":
         return _latest_by_mtime(items)
     if mode == "max":
-        return _max_by_score(items)
-    # mean returns synthetic
+        return _max_by_score(items, "score")
+    return None
+
+
+def _pick_mode_vt(items: list[dict], mode: RiskMode) -> dict | None:
+    # VT doesn't have "score" in the same sense; we choose:
+    # latest OR max by vt_score
+    if mode == "latest":
+        return _latest_by_mtime(items)
+    if mode == "max":
+        return _max_by_score(items, "vt_score")
     return None
 
 
@@ -240,21 +280,12 @@ def _severity_from_score(score: int) -> str:
 # --------------------------- dynamic event normalization (FIX) ---------------------------
 
 def _event_counts_any(events_obj: Any) -> dict:
-    """
-    Accept:
-      - dict counts: {"HOOK": 14, ...}
-      - list of event dicts: [{"tag":"HOOK",...}, ...]
-    Return:
-      - dict counts always.
-    """
     if isinstance(events_obj, dict):
-        # already counts; just coerce numeric-ish values
         out = {}
         for k, v in events_obj.items():
             try:
                 out[str(k)] = int(v)
             except Exception:
-                # non-numeric -> ignore
                 continue
         return out
 
@@ -270,20 +301,90 @@ def _event_counts_any(events_obj: Any) -> dict:
     return counts
 
 
+# --------------------------- VirusTotal aggregation logic ---------------------------
+
+def _vt_detected(vt_pick: Optional[dict]) -> bool:
+    if not vt_pick:
+        return False
+    st = vt_pick.get("stats") or {}
+    pos = _safe_int(st.get("positives"), 0)
+    mal = _safe_int(st.get("malicious"), 0)
+    sus = _safe_int(st.get("suspicious"), 0)
+    return (pos > 0) or (mal > 0) or (sus > 0)
+
+
+def _vt_contribution(vt_pick: Optional[dict]) -> dict:
+    """
+    Policy:
+      - If VT clean (0 positives): contribution <= 20 (or change to 15)
+      - If VT detects: contribution scales with vt_score + confidence + positives bucket,
+        but still bounded (cap 55). Can apply floors for high positives.
+    """
+    if not vt_pick:
+        return {"add": 0, "floor": 0, "reason": ""}
+
+    vt_score = _safe_int(vt_pick.get("vt_score", 0), 0)
+    conf = _safe_float(vt_pick.get("confidence", 0.0), 0.0)
+    if conf < 0:
+        conf = 0.0
+    if conf > 1:
+        conf = 1.0
+
+    st = vt_pick.get("stats") or {}
+    pos = _safe_int(st.get("positives", 0), 0)
+    total = _safe_int(st.get("total", 0), 0)
+
+    if pos <= 0:
+        add = int(round(vt_score * 0.6))
+        add = min(20, max(0, add))  # <=20 when clean (set to 15 if you want)
+        return {"add": add, "floor": 0, "reason": f"VirusTotal clean (0 positives) contributes {add} (cap 20)"}
+
+    mult = 0.8 + 0.8 * conf  # 0.8..1.6
+    add = int(round(vt_score * mult))
+
+    # bonuses by positives bucket
+    if pos >= 25:
+        bonus = 20
+    elif pos >= 15:
+        bonus = 14
+    elif pos >= 8:
+        bonus = 9
+    elif pos >= 3:
+        bonus = 5
+    else:
+        bonus = 2
+
+    add = add + bonus
+    add_cap = 55
+    add = min(add_cap, max(0, add))
+
+    floor = 0
+    if pos >= 20:
+        floor = 75
+    elif pos >= 12:
+        floor = 65
+    elif pos >= 7:
+        floor = 55
+
+    ratio = (pos / total) if total else 0.0
+    return {
+        "add": add,
+        "floor": floor,
+        "reason": f"VirusTotal detected {pos}/{total or '?'} positives (ratio {ratio:.2f}) => add {add} (cap {add_cap}), floor {floor}",
+    }
+
+
 # --------------------------- case aggregation ---------------------------
 
 def _collect_artifacts(case_dir: Path) -> dict:
     artifacts_dir = case_dir / "artifacts"
-    out = {"static": [], "dynamic": [], "yara": [], "memlite": []}
+    out = {"static": [], "dynamic": [], "yara": [], "memlite": [], "vt": []}
     if not artifacts_dir.exists():
         return out
 
     for p in sorted(artifacts_dir.glob("*.json")):
         name = p.name
-        try:
-            obj = _load_json(p)
-        except Exception:
-            continue
+        obj = _load_json(p)
 
         if name.startswith("apk_static__"):
             out["static"].append(_normalize_static(obj, name, p))
@@ -293,6 +394,8 @@ def _collect_artifacts(case_dir: Path) -> dict:
             out["yara"].append(_normalize_yara(obj, name, p))
         elif name.startswith("memlite__"):
             out["memlite"].append(_normalize_memlite(obj, name, p))
+        elif name.startswith("vt__"):
+            out["vt"].append(_normalize_vt(obj, name, p))
 
     return out
 
@@ -301,10 +404,7 @@ def _case_meta(case_dir: Path) -> dict:
     case_json = case_dir / "case.json"
     if not case_json.exists():
         return {"id": case_dir.name, "created_at": "unknown"}
-    try:
-        cj = _load_json(case_json)
-    except Exception:
-        cj = {}
+    cj = _load_json(case_json)
     return {
         "id": cj.get("id", case_dir.name),
         "created_at": cj.get("created_at", cj.get("created", "unknown")),
@@ -312,53 +412,71 @@ def _case_meta(case_dir: Path) -> dict:
     }
 
 
-def _benign_cap_applies(static_score: int, dyn_score: int, yara_unlock: bool) -> bool:
-    # If neither static nor dynamic show high-confidence malware,
-    # and we don't have a high-confidence YARA unlock, cap verdict to avoid false positives.
-    base = max(_safe_int(static_score, 0), _safe_int(dyn_score, 0))
+def _benign_cap_applies(static_score: int, dyn_score: int, yara_unlock: bool, vt_detected: bool) -> bool:
+    # cap only if: no strong signals AND no VT detection
     if yara_unlock:
         return False
+    if vt_detected:
+        return False
+    base = max(_safe_int(static_score, 0), _safe_int(dyn_score, 0))
     return base < 20
 
 
-def _aggregate_case_score(static_score: int, dyn_score: int, yara_score: int, mem_score: int, yara_unlock: bool) -> dict:
-    # Primary signals
+def _aggregate_case_score(
+    static_score: int,
+    dyn_score: int,
+    yara_score: int,
+    mem_score: int,
+    yara_unlock: bool,
+    vt_pick: Optional[dict],
+) -> dict:
+    # Primary signals (keep your original base behavior)
     base = max(_safe_int(static_score, 0), _safe_int(dyn_score, 0))
 
-    # Extras are intentionally capped to avoid benign -> malware inflation
+    # Extras capped
     mem_cap = 10
     yara_low_cap = 10
-
     mem_contrib = min(_safe_int(mem_score, 0), mem_cap)
+
+    # VT logic
+    vt_det = _vt_detected(vt_pick)
+    vt = _vt_contribution(vt_pick)
+    vt_add = _safe_int(vt.get("add", 0), 0)
+    vt_floor = _safe_int(vt.get("floor", 0), 0)
+
+    reasons: list[str] = []
+    reasons.append(f"Static/Dynamic base: {base}")
+    reasons.append(f"MemLite contributes {mem_contrib} (cap {mem_cap})")
+
+    total = base + mem_contrib
 
     if yara_unlock:
         yara_contrib = _safe_int(yara_score, 0)
         bonus = 5
-        reasons = [
-            f"Static/Dynamic base: {base}",
-            f"MemLite contributes {mem_contrib} (cap {mem_cap})",
-            f"YARA contributes {yara_contrib} (high-confidence unlock)",
-            f"YARA unlock bonus (+{bonus})",
-        ]
-        total = base + mem_contrib + yara_contrib + bonus
+        total += yara_contrib + bonus
+        reasons.append(f"YARA contributes {yara_contrib} (high-confidence unlock)")
+        reasons.append(f"YARA unlock bonus (+{bonus})")
     else:
         yara_contrib = min(_safe_int(yara_score, 0), yara_low_cap)
-        reasons = [
-            f"Static/Dynamic base: {base}",
-            f"MemLite contributes {mem_contrib} (cap {mem_cap})",
-            f"YARA contributes {yara_contrib} (low-confidence cap {yara_low_cap})",
-        ]
-        total = base + mem_contrib + yara_contrib
+        total += yara_contrib
+        reasons.append(f"YARA contributes {yara_contrib} (low-confidence cap {yara_low_cap})")
+
+    if vt_pick:
+        total += vt_add
+        reasons.append(vt.get("reason", f"VirusTotal contributes {vt_add}"))
+        if vt_floor:
+            if total < vt_floor:
+                reasons.append(f"VirusTotal floor applied ({vt_floor})")
+            total = max(total, vt_floor)
 
     total = _clamp(total, 0, 100)
 
-    if _benign_cap_applies(static_score, dyn_score, yara_unlock):
-        # hard cap (benign-aware)
+    if _benign_cap_applies(static_score, dyn_score, yara_unlock, vt_detected=vt_det):
         total = min(total, 19)
-        reasons.append("Benign-aware cap applied (no high-confidence indicators) → score capped at 19/100.")
+        reasons.append("Benign-aware cap applied (no high-confidence indicators + VT clean) → score capped at 19/100.")
 
     sev = _severity_from_score(total)
-    return {"score": total, "severity": sev, "reasons": reasons}
+    return {"score": total, "severity": sev, "reasons": reasons, "vt_detected": vt_det}
 
 
 # --------------------------- HTML template ---------------------------
@@ -520,17 +638,13 @@ def _tab_script() -> str:
     return r"""
 <script>
 (function(){
-  function $(sel){ return document.querySelector(sel); }
   function $all(sel){ return Array.from(document.querySelectorAll(sel)); }
-
   $all("[data-tab]").forEach(function(btn){
     btn.addEventListener("click", function(){
       var group = btn.getAttribute("data-group");
       var target = btn.getAttribute("data-tab");
-
       $all('[data-group="'+group+'"][data-tab]').forEach(function(b){ b.classList.remove("active"); });
       btn.classList.add("active");
-
       $all('[data-panel="'+group+'"]').forEach(function(p){ p.classList.remove("active"); });
       var panel = document.getElementById(target);
       if(panel) panel.classList.add("active");
@@ -565,46 +679,33 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
     meta = _case_meta(case_path)
     artifacts = _collect_artifacts(case_path)
 
-    # Choose per-mode representative artifacts (or synth)
     static_pick = _pick_mode(artifacts["static"], risk_mode)
     dyn_pick = _pick_mode(artifacts["dynamic"], risk_mode)
     yara_pick = _pick_mode(artifacts["yara"], risk_mode)
     mem_pick = _pick_mode(artifacts["memlite"], risk_mode)
+    vt_pick = _pick_mode_vt(artifacts["vt"], risk_mode)
 
     static_score = _safe_int((static_pick or {}).get("score", 0), 0) if risk_mode != "mean" else _mean_score(artifacts["static"])
     dyn_score = _safe_int((dyn_pick or {}).get("score", 0), 0) if risk_mode != "mean" else _mean_score(artifacts["dynamic"])
     yara_score = _safe_int((yara_pick or {}).get("score", 0), 0) if risk_mode != "mean" else _mean_score(artifacts["yara"])
     mem_score = _safe_int((mem_pick or {}).get("score", 0), 0) if risk_mode != "mean" else _mean_score(artifacts["memlite"])
 
-    # High-confidence unlock only if explicitly set by YARA scoring
     yara_unlock = bool((yara_pick or {}).get("malicious_unlock", False))
-    agg = _aggregate_case_score(static_score, dyn_score, yara_score, mem_score, yara_unlock=yara_unlock)
+    agg = _aggregate_case_score(static_score, dyn_score, yara_score, mem_score, yara_unlock=yara_unlock, vt_pick=vt_pick)
 
     final_score = _safe_int(agg.get("score", 0), 0)
     final_sev = agg.get("severity", "UNKNOWN")
     final_band = _score_band(final_score)
 
-    # summary object for HTML (keeps lists for tables)
-    summary = {
-        "static": artifacts["static"],
-        "dynamic": artifacts["dynamic"],
-        "yara": artifacts["yara"],
-        "memlite": artifacts["memlite"],
-        "picked": {
-            "static": static_pick,
-            "dynamic": dyn_pick,
-            "yara": yara_pick,
-            "memlite": mem_pick,
-        },
-        "final": {
-            "score": final_score,
-            "severity": final_sev,
-            "reasons": agg.get("reasons", []) or [],
-            "yara_unlock": yara_unlock,
-        },
-    }
+    vt_det = bool(agg.get("vt_detected", False))
+    vt_info = vt_pick or {}
+    vt_stats = (vt_info.get("stats") or {}) if isinstance(vt_info, dict) else {}
+    vt_pos = _safe_int(vt_stats.get("positives", 0), 0)
+    vt_total = _safe_int(vt_stats.get("total", 0), 0)
+    vt_score = _safe_int(vt_info.get("vt_score", 0), 0)
+    vt_conf = _safe_float(vt_info.get("confidence", 0.0), 0.0)
+    vt_url = str(vt_info.get("gui_url", "") or "")
 
-    # render sections
     header = f"""
 <div class="container">
   <div class="header">
@@ -616,7 +717,8 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
         <span class="pill"><span class="badge sev {sev_badge_class(final_sev)}">{_escape(final_sev)}</span></span>
         <span class="pill"><span class="badge score {final_band}">Final Score: <b>{final_score}</b>/100</span></span>
         <span class="pill">Risk mode: <b>{_escape(risk_mode)}</b></span>
-        <span class="pill">Malicious unlock: <b>{"YES" if yara_unlock else "NO"}</b></span>
+        <span class="pill">YARA unlock: <b>{"YES" if yara_unlock else "NO"}</b></span>
+        <span class="pill">VT: <b>{"DETECTED" if vt_det else "CLEAN/NA"}</b></span>
       </div>
     </div>
     <div class="tabs">
@@ -625,13 +727,13 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
       <div class="tab" data-group="main" data-tab="panel_dynamic">Dynamic</div>
       <div class="tab" data-group="main" data-tab="panel_yara">YARA</div>
       <div class="tab" data-group="main" data-tab="panel_memlite">MemLite</div>
+      <div class="tab" data-group="main" data-tab="panel_vt">VirusTotal</div>
       <div class="tab" data-group="main" data-tab="panel_top">Top / Why</div>
     </div>
   </div>
 """
 
-    # --- Overview panel ---
-    final_reasons = summary["final"]["reasons"]
+    final_reasons = agg.get("reasons", []) or []
     reasons_html = "<ul class='compact'>" + "".join(f"<li>{_escape(r)}</li>" for r in final_reasons) + "</ul>"
 
     overview = f"""
@@ -646,19 +748,18 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
           <span class="pill">Dynamic: <b class="mono">{dyn_score}</b></span>
           <span class="pill">YARA: <b class="mono">{yara_score}</b></span>
           <span class="pill">MemLite: <b class="mono">{mem_score}</b></span>
+          <span class="pill">VT: <b class="mono">{vt_pos}/{vt_total if vt_total else "?"}</b></span>
         </div>
-        <div class="small muted">Static/Dynamic are the primary risk signals. YARA + MemLite are capped “extras” unless a high-confidence YARA unlock is present.</div>
+        <div class="small muted">Static/Dynamic are primary signals. YARA + MemLite are capped extras unless a high-confidence YARA unlock is present. VirusTotal is secondary (clean ⇒ capped add; detected ⇒ scaled).</div>
         <div class="section">{reasons_html}</div>
       </div>
     </div>
-
-    <div class="card panel active" id="panel_overview_side" data-panel="main" style="display:none"></div>
   </div>
 """
 
-    # --- Static panel ---
+    # Static panel
     static_rows = ""
-    for s in summary.get("static", []) or []:
+    for s in artifacts.get("static", []) or []:
         sev = s.get("severity", "UNKNOWN")
         score = _safe_int(s.get("score", 0), 0)
         band = _score_band(score)
@@ -685,17 +786,13 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
   </div>
 """
 
-    # --- Dynamic panel ---
+    # Dynamic panel
     dyn_rows = ""
-    for d in summary.get("dynamic", []) or []:
+    for d in artifacts.get("dynamic", []) or []:
         sev = d.get("severity", "UNKNOWN")
         score = _safe_int(d.get("score", 0), 0)
         band = _score_band(score)
-
-        # FIX: events can be dict counts OR list of event dicts
-        events = d.get("events", {}) or {}
-        events_counts = _event_counts_any(events)
-
+        events_counts = _event_counts_any(d.get("events", {}) or {})
         hook = _safe_int(events_counts.get("HOOK", 0), 0)
         native = _safe_int(events_counts.get("NATIVE", 0), 0)
         ready = _safe_int(events_counts.get("READY", 0), 0)
@@ -723,10 +820,10 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
   </div>
 """
 
-    # --- YARA panel ---
+    # YARA panel
     yara_rows = ""
     yara_why = ""
-    for y in summary.get("yara", []) or []:
+    for y in artifacts.get("yara", []) or []:
         sev_y = y.get("severity", "UNKNOWN")
         score_y = _safe_int(y.get("score", 0), 0)
         band_y = _score_band(score_y)
@@ -735,16 +832,11 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
         mcount = len(matches_list)
 
         top_rules = ", ".join(
-            [
-                str(m.get("rule") or "")
-                for m in matches_list[:6]
-                if isinstance(m, dict) and (m.get("rule") or "")
-            ]
-        )
-        top_rules = top_rules if top_rules else "(no rules listed)"
+            [str(m.get("rule") or "") for m in matches_list[:6] if isinstance(m, dict) and (m.get("rule") or "")]
+        ) or "(no rules listed)"
 
         reasons = (y.get("reasons", []) or [])
-        reasons_html = "<ul class='compact'>" + "".join(f"<li>{_escape(r)}</li>" for r in reasons) + "</ul>"
+        reasons_html2 = "<ul class='compact'>" + "".join(f"<li>{_escape(r)}</li>" for r in reasons) + "</ul>"
 
         yara_rows += (
             "<tr>"
@@ -765,7 +857,7 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
             f"<span class='pill'>Matches: <span class='mono'>{mcount}</span></span>"
             f"<span class='pill'>Artifact: <code>{_escape(y.get('artifact_name',''))}</code></span>"
             f"</div>"
-            f"{reasons_html}"
+            f"{reasons_html2}"
             "</div>"
         )
 
@@ -785,16 +877,16 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
   </div>
 """
 
-    # --- MemLite panel ---
+    # MemLite panel
     mem_rows = ""
     mem_why = ""
-    for m in summary.get("memlite", []) or []:
+    for m in artifacts.get("memlite", []) or []:
         sev_m = m.get("severity", "UNKNOWN")
         score_m = _safe_int(m.get("score", 0), 0)
         band_m = _score_band(score_m)
 
         reasons = (m.get("reasons", []) or [])
-        reasons_html = "<ul class='compact'>" + "".join(f"<li>{_escape(r)}</li>" for r in reasons) + "</ul>"
+        reasons_html3 = "<ul class='compact'>" + "".join(f"<li>{_escape(r)}</li>" for r in reasons) + "</ul>"
 
         mem_rows += (
             "<tr>"
@@ -813,7 +905,7 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
             f"<span class='badge score {band_m}'>Score: <b>{score_m}</b>/100</span>"
             f"<span class='pill'>Artifact: <code>{_escape(m.get('artifact_name',''))}</code></span>"
             f"</div>"
-            f"{reasons_html}"
+            f"{reasons_html3}"
             "</div>"
         )
 
@@ -833,7 +925,57 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
   </div>
 """
 
-    # --- Top / Why panel ---
+    # VT panel
+    vt_rows = ""
+    for v in artifacts.get("vt", []) or []:
+        st = v.get("stats") or {}
+        pos = _safe_int(st.get("positives", 0), 0)
+        tot = _safe_int(st.get("total", 0), 0)
+        vt_s = _safe_int(v.get("vt_score", 0), 0)
+        conf = _safe_float(v.get("confidence", 0.0), 0.0)
+        url = str(v.get("gui_url", "") or "")
+        sha = str(v.get("sha256", "") or "")
+        label = "DETECTED" if pos > 0 else "CLEAN"
+        vt_rows += (
+            "<tr>"
+            f"<td><code>{_escape(v.get('artifact_name',''))}</code><div class='muted small'>{_escape(v.get('artifact_mtime_utc',''))}</div></td>"
+            f"<td class='mono'>{_escape(label)} • {pos}/{tot if tot else '?'}</td>"
+            f"<td class='mono'>vt_score {vt_s} • conf {conf:.2f}</td>"
+            f"<td class='small mono'>{_escape(sha)}</td>"
+            f"<td class='small'>{(f'<a href=\"{_escape(url)}\" target=\"_blank\">Open VT GUI</a>' if url else '<span class=\"muted\">(no url)</span>')}</td>"
+            "</tr>"
+        )
+    if not vt_rows:
+        vt_rows = "<tr><td colspan='5' class='muted'>No VirusTotal artifacts found.</td></tr>"
+
+    vt_pick_line = ""
+    if vt_pick:
+        vt_pick_line = (
+            f"<div class='why-card'>"
+            f"<div class='why-title'>Picked VT result</div>"
+            f"<div class='why-meta'>"
+            f"<span class='pill'>positives: <b class='mono'>{vt_pos}/{vt_total if vt_total else '?'}</b></span>"
+            f"<span class='pill'>vt_score: <b class='mono'>{vt_score}</b></span>"
+            f"<span class='pill'>confidence: <b class='mono'>{vt_conf:.2f}</b></span>"
+            f"</div>"
+            f"<div class='small muted'>Rule: clean ⇒ capped add (≤20). detected ⇒ scaled add + optional floors for high positives.</div>"
+            f"{(f'<div class=\"small\" style=\"margin-top:8px;\"><a href=\"{_escape(vt_url)}\" target=\"_blank\">Open in VirusTotal GUI</a></div>' if vt_url else '')}"
+            f"</div>"
+        )
+
+    vt_panel = f"""
+  <div class="card panel" id="panel_vt" data-panel="main">
+    <h2>VirusTotal</h2>
+    <div class="body">
+      {vt_pick_line}
+      <table class="table" style="margin-top:12px;">
+        <thead><tr><th>Artifact</th><th>Verdict</th><th>Score/Conf</th><th>SHA256</th><th>Link</th></tr></thead>
+        <tbody>{vt_rows}</tbody>
+      </table>
+    </div>
+  </div>
+"""
+
     top_panel = f"""
   <div class="card panel" id="panel_top" data-panel="main">
     <h2>Why this verdict</h2>
@@ -845,10 +987,11 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
           <span class="badge score {final_band}">Final Score: <b>{final_score}</b>/100</span>
           <span class="pill">Base (Static/Dynamic): <b class="mono">{max(static_score, dyn_score)}</b></span>
           <span class="pill">YARA unlock: <b>{'YES' if yara_unlock else 'NO'}</b></span>
+          <span class="pill">VT detected: <b>{'YES' if vt_det else 'NO'}</b></span>
         </div>
         {reasons_html}
       </div>
-      <div class="small muted">Tip: keep YARA + MemLite capped to avoid benign inflation. Only allow unlock on curated high-confidence rules.</div>
+      <div class="small muted">Tip: keep YARA + MemLite capped to avoid benign inflation. VT clean should never push the case above ~20 by itself.</div>
     </div>
   </div>
 """
@@ -858,7 +1001,7 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
 </div>
 """
 
-    body = header + "<div class='tabpanels'>" + overview + static_panel + dyn_panel + yara_panel + mem_panel + top_panel + "</div>" + footer
+    body = header + "<div class='tabpanels'>" + overview + static_panel + dyn_panel + yara_panel + mem_panel + vt_panel + top_panel + "</div>" + footer
     html = _html_page(f"CYBERSHADOW Case Report • {meta.get('id','')}", body)
 
     out_path = case_path / f"case__{meta.get('id', case_path.name)}.html"

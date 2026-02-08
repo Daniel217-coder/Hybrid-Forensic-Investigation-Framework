@@ -8,20 +8,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-# ============================================================
-# Public API (kept stable for src.main imports)
-# ============================================================
-
 __all__ = [
     "generate_apk_html_report",
     "write_apk_html_report",
     "write_apk_html",
 ]
 
-
-# ============================================================
-# Helpers
-# ============================================================
 
 def _load_json(p: Path) -> dict:
     try:
@@ -33,6 +25,13 @@ def _load_json(p: Path) -> dict:
 def _safe_int(x: Any, default: int = 0) -> int:
     try:
         return int(x)
+    except Exception:
+        return default
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
     except Exception:
         return default
 
@@ -62,7 +61,6 @@ def _html_escape(s: Any) -> str:
 
 
 def _score_band(score: int) -> str:
-    # Requested thresholds: green <20, yellow <50, orange <75, red >=75
     s = _clamp(_safe_int(score, 0), 0, 100)
     if s < 20:
         return "SCORE_GREEN"
@@ -92,12 +90,10 @@ def _artifact_stem(name: str) -> str:
 
 
 def _report_name_for_artifact(artifact_name: str) -> str:
-    # UI expects: reports/apk_report__<artifact_stem>.html
     return f"apk_report__{_artifact_stem(artifact_name)}.html"
 
 
 def _artifact_json_href(artifact_name: str) -> str:
-    # report is in cases/<CASE>/reports ; artifacts are in ../artifacts
     return f"../artifacts/{artifact_name}"
 
 
@@ -116,10 +112,6 @@ def _uniq(items: Any) -> list[str]:
         out.append(s)
     return out
 
-
-# ============================================================
-# Normalization of artifact JSON (works for both static/dynamic)
-# ============================================================
 
 @dataclass
 class ApkArtifactView:
@@ -164,7 +156,6 @@ def _extract_scoring(obj: dict) -> tuple[int, str, list[str], str]:
 
 
 def _extract_iocs(obj: dict) -> dict:
-    # prefer iocs_split if present, else iocs/runtime.iocs
     iocs = obj.get("iocs_split")
     if isinstance(iocs, dict):
         return iocs
@@ -210,16 +201,69 @@ def _normalize_artifact(artifact_path: Path) -> ApkArtifactView:
     )
 
 
-# ============================================================
-# Main generator (THIS is what src.main imports)
-# ============================================================
+# ---------------- VirusTotal: pick latest vt__*.json in same case ----------------
+
+def _pick_latest_vt(artifacts_dir: Path) -> Optional[Path]:
+    try:
+        files = sorted(list(artifacts_dir.glob("vt__*.json")), key=lambda p: p.stat().st_mtime, reverse=True)
+        return files[0] if files else None
+    except Exception:
+        return None
+
+
+def _vt_card_html(vt_path: Optional[Path]) -> str:
+    if not vt_path or not vt_path.exists():
+        return (
+            "<div class='card'>"
+            "<h2 style='margin:0 0 8px 0;'>VirusTotal</h2>"
+            "<div class='small muted'>(no VT artifact found)</div>"
+            "</div>"
+        )
+
+    obj = _load_json(vt_path)
+    stats = obj.get("stats") if isinstance(obj.get("stats"), dict) else {}
+    mal = _safe_int(stats.get("malicious"), 0)
+    sus = _safe_int(stats.get("suspicious"), 0)
+    pos = _safe_int(stats.get("positives"), mal + sus)
+    tot = _safe_int(stats.get("total"), 0)
+    vt_score = _safe_int(obj.get("vt_score"), 0)
+    conf = _safe_float(obj.get("confidence"), 0.0)
+    if conf < 0:
+        conf = 0.0
+    if conf > 1:
+        conf = 1.0
+
+    verdict = "DETECTED" if pos > 0 else "CLEAN"
+    gui_url = str(obj.get("gui_url", "") or "")
+    sha = str(obj.get("sha256", "") or "")
+    json_href = f"../artifacts/{vt_path.name}"
+
+    note = (
+        "Policy: VT is secondary. If clean (0 positives), its influence is capped (≤20). "
+        "If detected, contribution scales with findings."
+    )
+
+    link_html = f"<a class='btn ghost' href='{_html_escape(gui_url)}' target='_blank'>Open VT GUI</a>" if gui_url else ""
+    return f"""
+<div class="card">
+  <h2 style="margin:0 0 8px 0;">VirusTotal</h2>
+  <div class="row">
+    <span class="pill"><b>Verdict:</b> <span class="mono">{_html_escape(verdict)}</span></span>
+    <span class="pill"><b>Positives:</b> <span class="mono">{pos}/{tot if tot else "?"}</span></span>
+    <span class="pill"><b>vt_score:</b> <span class="mono">{vt_score}</span></span>
+    <span class="pill"><b>confidence:</b> <span class="mono">{conf:.2f}</span></span>
+    {f"<span class='pill'><b>sha256:</b> <span class='mono'>{_html_escape(sha[:16] + '…')}</span></span>" if sha else ""}
+  </div>
+  <div class="small muted" style="margin-top:10px;">{_html_escape(note)}</div>
+  <div class="row" style="margin-top:12px; gap:10px;">
+    <a class="btn ghost" href="{_html_escape(json_href)}">Open VT artifact JSON</a>
+    {link_html}
+  </div>
+</div>
+"""
+
 
 def generate_apk_html_report(case_dir: str, apk_artifact: Optional[str] = None) -> str:
-    """
-    Generate a standalone HTML report for one APK artifact (static OR dynamic).
-    This function name MUST exist (src.main imports it).
-    Returns absolute path to the generated HTML file.
-    """
     case_path = Path(case_dir)
     artifacts_dir = case_path / "artifacts"
     reports_dir = case_path / "reports"
@@ -228,7 +272,6 @@ def generate_apk_html_report(case_dir: str, apk_artifact: Optional[str] = None) 
     artifact_path: Optional[Path] = None
 
     if apk_artifact:
-        # accept absolute, relative, or filename
         cand = Path(apk_artifact)
         if cand.exists():
             artifact_path = cand
@@ -238,14 +281,12 @@ def generate_apk_html_report(case_dir: str, apk_artifact: Optional[str] = None) 
                 artifact_path = cand2
 
     if artifact_path is None:
-        # fallback: latest matching artifact
         if artifacts_dir.is_dir():
             files = list(artifacts_dir.glob("apk_*__*.json"))
             files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             artifact_path = files[0] if files else None
 
     if artifact_path is None or not artifact_path.exists():
-        # still generate a minimal HTML to avoid crashing pipelines
         out = reports_dir / "apk_report__missing.html"
         out.write_text(
             "<html><body style='font-family:Arial;background:#0b1020;color:#E5E7EB;padding:24px;'>"
@@ -282,6 +323,9 @@ def generate_apk_html_report(case_dir: str, apk_artifact: Optional[str] = None) 
             f"<ul class='ioc-list'>{lis}</ul>{more}"
             f"</div>"
         )
+
+    vt_path = _pick_latest_vt(artifacts_dir)
+    vt_card = _vt_card_html(vt_path)
 
     html = f"""<!doctype html>
 <html>
@@ -439,6 +483,8 @@ code {{
     {reasons_html}
   </div>
 
+  {vt_card}
+
   <div class="card">
     <h2 style="margin:0 0 8px 0;">IOCs</h2>
     <div class="small muted">extracted indicators of compromise (deduplicated)</div>
@@ -460,7 +506,6 @@ code {{
     return str(out.resolve())
 
 
-# Backwards-compat aliases (some older code called these)
 def write_apk_html_report(case_dir: str, apk_artifact: Optional[str] = None) -> str:
     return generate_apk_html_report(case_dir, apk_artifact)
 
