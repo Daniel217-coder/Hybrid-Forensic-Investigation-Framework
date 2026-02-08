@@ -29,10 +29,37 @@ import sys
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 
 # ---------------- utils ----------------
+
+def force_extract_native_libs_true(manifest_path: str) -> None:
+    import re
+
+    xml = Path(manifest_path).read_text(encoding="utf-8", errors="replace")
+
+    # If attribute exists, flip to true
+    if "android:extractNativeLibs" in xml:
+        xml2 = re.sub(
+            r'android:extractNativeLibs\s*=\s*"false"',
+            'android:extractNativeLibs="true"',
+            xml,
+            flags=re.IGNORECASE,
+        )
+        xml = xml2
+    else:
+        # Add attribute into <application ...>
+        xml = re.sub(
+            r"(<application\b)([^>]*)(>)",
+            r'\1\2 android:extractNativeLibs="true"\3',
+            xml,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    Path(manifest_path).write_text(xml, encoding="utf-8")
+
 
 def utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -87,6 +114,67 @@ def _infer_sdk_root_from_adb(adb_path: str) -> Optional[Path]:
 
 
 def find_android_sdk_tool(name: str) -> str:
+    """
+    Finds adb/zipalign/apksigner etc.
+    Supports:
+      - ANDROID_SDK_ROOT / ANDROID_HOME
+      - repo-local portable tools: <repo>/inputs/build-tools/<ver>/
+    On Windows, apksigner is usually apksigner.bat (NOT .exe).
+    """
+    # allow explicit overrides
+    if name.lower() == "adb":
+        env_adb = os.environ.get("ADB_PATH")
+        if env_adb and Path(env_adb).exists():
+            return str(Path(env_adb))
+
+    candidates: List[Path] = []
+
+    def add_build_tools_folder(bt: Path):
+        if not bt.exists():
+            return
+        vers = sorted([p for p in bt.iterdir() if p.is_dir()], reverse=True)
+        for v in vers[:12]:
+            if os.name == "nt":
+                candidates.extend([
+                    v / (name + ".exe"),
+                    v / (name + ".bat"),
+                    v / (name + ".cmd"),
+                    v / name,
+                ])
+            else:
+                candidates.extend([v / name, v / (name + ".sh")])
+
+    # 1) Android SDK env
+    sdk = os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME")
+    if sdk:
+        sdkp = Path(sdk)
+        if name.lower() == "adb":
+            candidates += [sdkp / "platform-tools" / "adb.exe", sdkp / "platform-tools" / "adb"]
+        else:
+            add_build_tools_folder(sdkp / "build-tools")
+
+    # 2) repo-local portable build-tools: <repo>/inputs/build-tools
+    # repack_with_gadget.py is in <repo>/tools/, so repo = parents[1]
+    try:
+        repo_root = Path(__file__).resolve().parents[1]
+        add_build_tools_folder(repo_root / "inputs" / "build-tools")
+    except Exception:
+        pass
+
+    for c in candidates:
+        if c.exists():
+            return str(c)
+
+    # 3) fallback PATH
+    w = which(name) or which(name + ".exe") or which(name + ".bat") or which(name + ".cmd")
+    if w:
+        return w
+
+    raise FileNotFoundError(
+        f"Android SDK tool not found: {name}. "
+        f"Install Android SDK Build-Tools (for zipalign/apksigner) and set ANDROID_SDK_ROOT, "
+        f"or place tools under inputs/build-tools/<ver>/, or put tools in PATH.")
+
     # allow explicit overrides
     if name.lower() == "adb":
         env_adb = os.environ.get("ADB_PATH")
@@ -110,6 +198,29 @@ def find_android_sdk_tool(name: str) -> str:
     for c in candidates:
         if c.exists():
             return str(c)
+
+        # --- NEW: allow vendored build-tools inside repo: inputs/build-tools/<ver> ---
+    try:
+        repo_root = Path(__file__).resolve().parents[1]  # tools/ -> repo root
+        local_bt = repo_root / "inputs" / "build-tools"
+
+        if name == "adb":
+            # optional: inputs/platform-tools/adb(.exe)
+            pt = repo_root / "inputs" / "platform-tools"
+            for cc in [v / (name + ".exe"), v / (name + ".bat"), v / (name + ".cmd"), v / name]:
+                if cc.exists():
+                    return str(cc)
+
+
+        if local_bt.exists() and local_bt.is_dir() and name != "adb":
+            vers = sorted([p for p in local_bt.iterdir() if p.is_dir()], reverse=True)
+            for v in vers[:8]:
+                for cc in [v / (name + ".exe"), v / name]:
+                    if cc.exists():
+                        return str(cc)
+    except Exception:
+        pass
+
 
     # fallback PATH
     w = which(name) or which(name + ".exe") or which(name + ".bat") or which(name + ".cmd")
@@ -432,6 +543,8 @@ def main():
     if dec.exists():
         shutil.rmtree(dec, ignore_errors=True)
     run([apktool, "d", "-f", str(apk), "-o", str(dec)], check=True)
+    # FIX: avoid INSTALL_FAILED_INVALID_APK (native libs extraction issues)
+    force_extract_native_libs_true(str(dec / "AndroidManifest.xml"))
 
     # Determine ABI
     abi = args.abi

@@ -1,4 +1,4 @@
-# src/case_report.py
+﻿# src/case_report.py
 from __future__ import annotations
 
 import json
@@ -235,6 +235,39 @@ def _severity_from_score(score: int) -> str:
     if s < 75:
         return "HIGH"
     return "CRITICAL"
+
+
+# --------------------------- dynamic event normalization (FIX) ---------------------------
+
+def _event_counts_any(events_obj: Any) -> dict:
+    """
+    Accept:
+      - dict counts: {"HOOK": 14, ...}
+      - list of event dicts: [{"tag":"HOOK",...}, ...]
+    Return:
+      - dict counts always.
+    """
+    if isinstance(events_obj, dict):
+        # already counts; just coerce numeric-ish values
+        out = {}
+        for k, v in events_obj.items():
+            try:
+                out[str(k)] = int(v)
+            except Exception:
+                # non-numeric -> ignore
+                continue
+        return out
+
+    counts: dict[str, int] = {}
+    if isinstance(events_obj, list):
+        for e in events_obj:
+            if not isinstance(e, dict):
+                continue
+            tag = (e.get("tag") or e.get("type") or e.get("kind") or "").strip()
+            if not tag:
+                continue
+            counts[tag] = counts.get(tag, 0) + 1
+    return counts
 
 
 # --------------------------- case aggregation ---------------------------
@@ -659,10 +692,13 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
         score = _safe_int(d.get("score", 0), 0)
         band = _score_band(score)
 
+        # FIX: events can be dict counts OR list of event dicts
         events = d.get("events", {}) or {}
-        hook = _safe_int(events.get("HOOK", 0), 0)
-        native = _safe_int(events.get("NATIVE", 0), 0)
-        ready = _safe_int(events.get("READY", 0), 0)
+        events_counts = _event_counts_any(events)
+
+        hook = _safe_int(events_counts.get("HOOK", 0), 0)
+        native = _safe_int(events_counts.get("NATIVE", 0), 0)
+        ready = _safe_int(events_counts.get("READY", 0), 0)
 
         dyn_rows += (
             "<tr>"

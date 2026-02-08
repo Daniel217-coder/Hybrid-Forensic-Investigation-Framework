@@ -601,12 +601,14 @@ def _score_dynamic(
     reasons: List[str] = []
 
     if not install_ok:
-        score += 25
-        reasons.append("Install failed (+25)")
+        score += 2
+        reasons.append("Install failed (+2) [reliability]")
+
 
     if not launched_ok:
-        score += 12
-        reasons.append("Launch/monkey failed (+12)")
+        score += 1
+        reasons.append("Launch/monkey failed (+1) [reliability]")
+
 
     if crashed:
         score += 6
@@ -672,6 +674,9 @@ def _score_dynamic(
         score = int(round(score * 0.60))
         benign_cap_applied = True
         reasons.append("Benign cap/dampening applied (no strong malicious combo)")
+            # hard cap for observational (ADB-only) runs to avoid false positives
+        score = min(score, 15)
+
 
     score = _clamp(score, 0, 100)
     sev = _severity_from_score(score)
@@ -726,6 +731,11 @@ def _pidof(adb: Adb, pkg: str) -> List[str]:
         return []
     return [x for x in out.strip().split() if x.strip()]
 
+def _is_pkg_installed(adb: Adb, pkg: str) -> bool:
+    rc, out = adb.shell("pm", "path", pkg, timeout=15, check=False)
+    return (rc == 0) and ("package:" in (out or ""))
+
+
 def _detect_crash(log_text: str, pkg: str) -> bool:
     if "FATAL EXCEPTION" in (log_text or "") and pkg in (log_text or ""):
         return True
@@ -743,7 +753,7 @@ def run_dynamic(
     duration_sec: int = 25,
     monkey_events: int = 1,
     clear_logcat: bool = True,
-    keep_installed: bool = False,
+    keep_installed: bool = True,
 ) -> Dict[str, Any]:
     adb_path = _find_adb()
     serial = device_serial or _pick_device_serial(adb_path)
@@ -756,11 +766,14 @@ def run_dynamic(
         raise RuntimeError("Device boot not completed. Wait for emulator/device to fully boot.")
 
     pkg = read_package_from_apk(apk_path)
+    was_installed_before = _is_pkg_installed(adb, pkg)
+    installed_by_us = not was_installed_before
     app_name = read_app_label_from_apk(apk_path)
     perms = read_permissions_from_apk(apk_path)
 
-    if not keep_installed:
+    if not keep_installed and installed_by_us:
         _uninstall_pkg(adb, pkg)
+
 
     install_ok, install_out = _install_apk(adb, apk_path)
 
@@ -918,9 +931,6 @@ def run_dynamic(
             "benign_cap_applied": bool(benign_cap_applied),
         },
     }
-
-    if not keep_installed:
-        _uninstall_pkg(adb, pkg)
 
     return result
 

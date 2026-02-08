@@ -320,7 +320,6 @@ def score_dynamic(event_counts: Dict[str, int], net_events: List[dict], logcat_a
     unlock_triggers: List[str] = []
 
     tcp_count = len(net_events or [])
-    # Hard tags (from JS)
     sms = event_counts.get("SMS", 0)
     proc = event_counts.get("PROC", 0)
     dload = event_counts.get("DLOAD", 0)
@@ -330,7 +329,6 @@ def score_dynamic(event_counts: Dict[str, int], net_events: List[dict], logcat_a
     crypto = event_counts.get("CRYPTO", 0)
     selftest = event_counts.get("SELFTEST", 0)
 
-    # Soft NET tags (if any)
     net = event_counts.get("OKHTTP", 0) + event_counts.get("HTTPURL", 0) + event_counts.get("WEBVIEW", 0)
     sock = event_counts.get("DNS", 0) + event_counts.get("SOCKET", 0)
 
@@ -357,22 +355,17 @@ def score_dynamic(event_counts: Dict[str, int], net_events: List[dict], logcat_a
         score += pts
         reasons.append(f"{why} (+{pts})")
 
-    # --- Soft signal: network presence (very low weight)
     if tcp_count > 0 or net > 0 or sock > 0:
-        # 1 point just for "network exists"
         add(1, f"Network presence observed (TCP={tcp_count}, NET={net}, SOCK={sock})")
-        # small extra if lots of distinct TCP observations, still benign-safe
         if tcp_count >= 50:
             add(1, "High volume TCP observations (still benign-weighted)")
 
-    # --- Anti-analysis in app logcat (hard trigger)
     la = (logcat_app_text or "").lower()
     anti_app = ("frida" in la) and (("detected" in la) or ("kill" in la) or ("terminate" in la))
     if anti_app:
         add(18, "Anti-instrumentation reaction detected in APP logcat")
         unlock_triggers.append("ANTI:app-logcat")
 
-    # --- Hard triggers + weights
     if sms > 0:
         add(50, f"SMS/content provider access observed (SMS={sms})")
         unlock_triggers.append("HARD:sms")
@@ -389,12 +382,9 @@ def score_dynamic(event_counts: Dict[str, int], net_events: List[dict], logcat_a
         add(18, f"Dangerous intent usage observed (INTENT={intent})")
         unlock_triggers.append("HARD:intent")
 
-    # FILE alone is common (cache). Keep moderate unless combined.
     if fileio > 0:
         add(8, f"File write/delete activity observed (FILE={fileio})")
-        # do NOT unlock on FILE alone
 
-    # --- Combo boosts (this is where malware jumps)
     if (proc > 0 or dload > 0) and (tcp_count > 0 or net > 0 or sock > 0):
         add(20, "Suspicious combo: network + exec/dynamic-load")
         if "HARD:combo_net_exec" not in unlock_triggers:
@@ -409,9 +399,6 @@ def score_dynamic(event_counts: Dict[str, int], net_events: List[dict], logcat_a
         add(30, "Critical combo: network + SMS access")
         if "HARD:combo_net_sms" not in unlock_triggers:
             unlock_triggers.append("HARD:combo_net_sms")
-
-    # Crypto is context only (no points by default)
-    # If you want later: only add points when combined with FILE+NET (ransom-ish)
 
     score = _clamp(score, 0, 100)
     malicious_unlock = len(unlock_triggers) > 0
@@ -628,36 +615,33 @@ def post_attach_seed_driver(adb: Adb, pkg: str, seed_url: str, repeat: int, inte
         time.sleep(max(1.0, float(interval_s)))
 
 
-def main():
-    ap = argparse.ArgumentParser(description="CyberShadow • Dynamic (Gadget + UID net monitor + strict scoring).")
-    ap.add_argument("--case", dest="case_dir", required=True)
-    ap.add_argument("--package", dest="package", required=True)
-    ap.add_argument("--tag", dest="tag", default="dyn")
-    ap.add_argument("--serial", dest="serial", default="")
+# -----------------------------
+# API-friendly args + runner
+# -----------------------------
 
-    ap.add_argument("--endpoint", dest="endpoint", default="127.0.0.1:27042")
-    ap.add_argument("--gadget-name", dest="gadget_name", default="Gadget")
+@dataclass
+class RunArgs:
+    case_dir: str
+    package: str
+    tag: str = "dyn"
+    serial: str = ""
+    endpoint: str = "127.0.0.1:27042"
+    gadget_name: str = "Gadget"
+    launch: str = "am"  # am|monkey|none
+    seed_url: str = ""
+    seed_repeat: int = 2
+    seed_interval: float = 3.0
+    drive: str = "none"  # none|allow|monkey|monkey+allow
+    monkey_events: int = 900
+    throttle_ms: int = 100
+    monkey_seed: int = 1337
+    preflight: int = 30
+    capture: int = 60
+    script_path: str = str(Path("src/cybershadow_dyn.js"))
+    force_stop_after: bool = True
 
-    ap.add_argument("--launch", dest="launch", choices=["am", "monkey", "none"], default="am")
 
-    ap.add_argument("--seed-url", dest="seed_url", default="")
-    ap.add_argument("--seed-repeat", dest="seed_repeat", type=int, default=2)
-    ap.add_argument("--seed-interval", dest="seed_interval", type=float, default=3.0)
-
-    ap.add_argument("--drive", dest="drive", choices=["none", "allow", "monkey", "monkey+allow"], default="none")
-    ap.add_argument("--monkey-events", dest="monkey_events", type=int, default=900)
-    ap.add_argument("--throttle-ms", dest="throttle_ms", type=int, default=100)
-    ap.add_argument("--monkey-seed", dest="monkey_seed", type=int, default=1337)
-
-    ap.add_argument("--preflight", dest="preflight", type=int, default=30)
-    ap.add_argument("--capture", dest="capture", type=int, default=60)
-    ap.add_argument("--script", dest="script_path", default=str(Path("src/cybershadow_dyn.js")))
-
-    ap.add_argument("--force-stop-after", dest="force_stop_after", action="store_true")
-    ap.set_defaults(force_stop_after=True)
-
-    args = ap.parse_args()
-
+def _run_with_args(args: RunArgs) -> Dict[str, Any]:
     adb_path = which_or_guess_adb()
     serial = detect_device(adb_path, args.serial or None)
     adb = Adb(adb_path, serial)
@@ -665,7 +649,7 @@ def main():
 
     script_path = Path(args.script_path)
     if not script_path.exists():
-        raise SystemExit(f"[ERROR] Script not found: {script_path}")
+        raise RuntimeError(f"Script not found: {script_path}")
     script_source = script_path.read_text(encoding="utf-8", errors="replace")
 
     case_path = Path(args.case_dir)
@@ -863,22 +847,137 @@ def main():
         encoding="utf-8"
     )
 
+    return {
+        "artifact": str(artifact_path),
+        "report": str(report_path),
+        "scoring": artifact.get("scoring", {}),
+        "package": args.package,
+        "device": {
+            "serial": devinfo.serial,
+            "release": devinfo.release,
+            "sdk": devinfo.sdk,
+            "abi": devinfo.abi,
+            "adb": adb_path,
+        },
+        "runtime": {
+            "gadget_ready": bool(gadget_ready),
+            "frida_attach_error": frida_err,
+            "frida_lines": len(frida_lines),
+            "net_observed_count": len(net_events),
+            "app_pid": app_pid,
+            "app_uid": app_uid,
+        },
+    }
+
+
+# -----------------------------
+# API entrypoint expected by api_local.py
+# -----------------------------
+def run_dynamic_analysis(
+    case_dir: str,
+    package: str,
+    tag: str = "dyn",
+    serial: str = "",
+    endpoint: str = "127.0.0.1:27042",
+    gadget_name: str = "Gadget",
+    script: str = "src/cybershadow_dyn.js",
+    launch: str = "am",
+    drive: str = "none",
+    monkey_events: int = 900,
+    throttle_ms: int = 100,
+    monkey_seed: int = 1337,
+    preflight: int = 30,
+    capture: int = 60,
+    force_stop_after: bool = True,
+) -> Dict[str, Any]:
+    """
+    Wrapper used by Local API.
+    Keeps CLI behavior intact; just runs the same pipeline programmatically.
+    """
+    args = RunArgs(
+        case_dir=case_dir,
+        package=package,
+        tag=tag,
+        serial=serial or "",
+        endpoint=endpoint,
+        gadget_name=gadget_name,
+        script_path=script,
+        launch=launch,
+        drive=drive,
+        monkey_events=int(monkey_events),
+        throttle_ms=int(throttle_ms),
+        monkey_seed=int(monkey_seed),
+        preflight=int(preflight),
+        capture=int(capture),
+        force_stop_after=bool(force_stop_after),
+    )
+    return _run_with_args(args)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="CyberShadow • Dynamic (Gadget + UID net monitor + strict scoring).")
+    ap.add_argument("--case", dest="case_dir", required=True)
+    ap.add_argument("--package", dest="package", required=True)
+    ap.add_argument("--tag", dest="tag", default="dyn")
+    ap.add_argument("--serial", dest="serial", default="")
+
+    ap.add_argument("--endpoint", dest="endpoint", default="127.0.0.1:27042")
+    ap.add_argument("--gadget-name", dest="gadget_name", default="Gadget")
+
+    ap.add_argument("--launch", dest="launch", choices=["am", "monkey", "none"], default="am")
+
+    ap.add_argument("--seed-url", dest="seed_url", default="")
+    ap.add_argument("--seed-repeat", dest="seed_repeat", type=int, default=2)
+    ap.add_argument("--seed-interval", dest="seed_interval", type=float, default=3.0)
+
+    ap.add_argument("--drive", dest="drive", choices=["none", "allow", "monkey", "monkey+allow"], default="none")
+    ap.add_argument("--monkey-events", dest="monkey_events", type=int, default=900)
+    ap.add_argument("--throttle-ms", dest="throttle_ms", type=int, default=100)
+    ap.add_argument("--monkey-seed", dest="monkey_seed", type=int, default=1337)
+
+    ap.add_argument("--preflight", dest="preflight", type=int, default=30)
+    ap.add_argument("--capture", dest="capture", type=int, default=60)
+    ap.add_argument("--script", dest="script_path", default=str(Path("src/cybershadow_dyn.js")))
+
+    ap.add_argument("--force-stop-after", dest="force_stop_after", action="store_true")
+    ap.set_defaults(force_stop_after=True)
+
+    a = ap.parse_args()
+
+    args = RunArgs(
+        case_dir=a.case_dir,
+        package=a.package,
+        tag=a.tag,
+        serial=a.serial or "",
+        endpoint=a.endpoint,
+        gadget_name=a.gadget_name,
+        launch=a.launch,
+        seed_url=a.seed_url,
+        seed_repeat=int(a.seed_repeat),
+        seed_interval=float(a.seed_interval),
+        drive=a.drive,
+        monkey_events=int(a.monkey_events),
+        throttle_ms=int(a.throttle_ms),
+        monkey_seed=int(a.monkey_seed),
+        preflight=int(a.preflight),
+        capture=int(a.capture),
+        script_path=a.script_path,
+        force_stop_after=bool(a.force_stop_after),
+    )
+
+    res = _run_with_args(args)
+
+    # Preserve your CLI summary output style
     print("== PIPELINE SUMMARY ==")
     print(f"Case: {args.case_dir}")
     print(f"APK: {args.package}")
     print("Transport: gadget")
-    print(f"Gadget ready: {bool(gadget_ready)} | Endpoint: {args.endpoint}")
-    print(f"AppPID: {app_pid}")
-    print(f"PkgPIDs: {pids}")
-    print(f"AttachedPIDs: {attached_pids}")
-    print(f"FridaLines: {len(frida_lines)}")
-    print(f"KeyCounts: {json.dumps(key_counts)}")
-    print(f"UnlockTriggers: {unlock_triggers}")
-    print(f"Severity: {severity}")
-    print(f"Score: {int(score)} / 100")
-    print(f"Unlock: {'YES' if malicious_unlock else 'NO'} | Cap: {'YES' if benign_cap_applied else 'NO'}")
-    print(f"Artifact: {str(artifact_path)}")
-    print(f"APK Report: {str(report_path)}")
+    print(f"Gadget ready: {res.get('runtime', {}).get('gadget_ready')} | Endpoint: {args.endpoint}")
+    print(f"AppPID: {res.get('runtime', {}).get('app_pid')}")
+    print(f"Severity: {res.get('scoring', {}).get('severity')}")
+    print(f"Score: {res.get('scoring', {}).get('score')} / 100")
+    print(f"Artifact: {res.get('artifact')}")
+    print(f"APK Report: {res.get('report')}")
     print("[DONE] return code: 0")
 
 

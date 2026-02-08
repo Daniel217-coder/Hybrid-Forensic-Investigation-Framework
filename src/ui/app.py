@@ -10,7 +10,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
-
+import time
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
@@ -34,6 +34,8 @@ try:
     _ctk_sf.CTkScrollableFrame.check_if_master_is_canvas = _check_if_master_is_canvas_patched
 except Exception:
     pass
+
+import urllib.request
 
 # --- FIX: ensure subprocess runs from project root (so `-m src.main` works) ---
 def _project_root_dir() -> str:
@@ -309,6 +311,65 @@ class CyberShadowHub(ctk.CTk):
             pass
 
         self.after(60, self._drain)
+
+    def _api_base(self) -> str:
+        return "http://127.0.0.1:8000"
+
+    def _http_get_json(self, url: str, timeout: int = 6) -> dict:
+        import urllib.request
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", errors="replace"))
+
+    def _refresh_devices_dropdown(self):
+        try:
+            data = self._http_get_json(self._api_base() + "/devices")
+            devs = data.get("devices", []) or []
+            default_serial = (data.get("default_serial") or "").strip()
+
+            labels = []
+            by_label = {}
+
+            for d in devs:
+                serial = (d.get("serial") or "").strip()
+                state = (d.get("state") or "").strip()
+                model = (d.get("model") or "").strip()
+                rel = (d.get("android_release") or "").strip()
+                sdk = (d.get("sdk") or "").strip()
+                is_emulator = bool(d.get("is_emulator", False))
+
+                nice = f"{serial} — {model or ('EMULATOR' if is_emulator else 'ANDROID')} — Android {rel or '?'} (SDK {sdk or '?'}) — {state}"
+                labels.append(nice)
+                by_label[nice] = serial
+
+            self._device_label_to_serial = by_label
+
+            if not labels:
+                labels = ["(no devices) — connect phone + USB debugging"]
+                by_label[labels[0]] = ""
+
+            # IMPORTANT: dyn_device_menu trebuie să existe înainte să chemăm configure()
+            if hasattr(self, "dyn_device_menu") and self.dyn_device_menu is not None:
+                self.dyn_device_menu.configure(values=labels)
+
+            # auto-select default
+            picked_label = None
+            if default_serial:
+                for lab, ser in by_label.items():
+                    if ser == default_serial:
+                        picked_label = lab
+                        break
+
+            if hasattr(self, "dyn_device_var") and self.dyn_device_var is not None:
+                if picked_label:
+                    self.dyn_device_var.set(picked_label)
+                else:
+                    cur = self.dyn_device_var.get().strip()
+                    if cur not in by_label:
+                        self.dyn_device_var.set(labels[0])
+
+        except Exception as e:
+            messagebox.showerror("Devices", f"Could not load /devices from API.\n\n{e}")
 
     # ---------------- Case path helpers ----------------
     def _case_abs(self) -> str:
@@ -772,7 +833,43 @@ class CyberShadowHub(ctk.CTk):
             fg_color="#334155", hover_color="#475569",
             height=38, font=ctk.CTkFont(size=13, weight="bold")
         )
+        action2.grid_columnconfigure((0, 1, 2, 3), weight=1)
+
         self.btn_final_risk.grid(row=0, column=3, sticky="ew")
+               # --- NEW: Repack + Install / Uninstall (separat) ---
+        self.btn_repack_install = ctk.CTkButton(
+            action2, text="Repack + Install (keep)",
+            command=self._run_repack_install_keep,
+            fg_color="#7C3AED", hover_color="#8B5CF6",
+            height=38, font=ctk.CTkFont(size=13, weight="bold")
+        )
+        self.btn_repack_install.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(8, 0))
+
+        self.btn_uninstall_pkg = ctk.CTkButton(
+            action2, text="Uninstall",
+            command=self._uninstall_selected_pkg,
+            fg_color="#7F1D1D", hover_color="#DC2626",
+            height=38, font=ctk.CTkFont(size=13, weight="bold")
+        )# --- NEW: Repack / Install / Uninstall controls (row 1 in action2) ---
+        action2.grid_rowconfigure(1, weight=0)
+
+        self.btn_repack_install = ctk.CTkButton(
+            action2, text="Repack + Install (keep)",
+            command=self._run_repack_install_keep,
+            fg_color="#7C3AED", hover_color="#8B5CF6",
+            height=38, font=ctk.CTkFont(size=13, weight="bold")
+        )
+        self.btn_repack_install.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(8, 0))
+
+        self.btn_uninstall_pkg = ctk.CTkButton(
+            action2, text="Uninstall",
+            command=self._uninstall_selected_pkg,
+            fg_color="#7F1D1D", hover_color="#DC2626",
+            height=38, font=ctk.CTkFont(size=13, weight="bold")
+        )
+        self.btn_uninstall_pkg.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+
+
 
         # ---- Case Folder
         ctk.CTkLabel(
@@ -1066,8 +1163,32 @@ class CyberShadowHub(ctk.CTk):
                     font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
         ctk.CTkLabel(row3, text="Seed interval (sec)", text_color="#E5E7EB",
                     font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=1, sticky="w", padx=(0, 8))
-        ctk.CTkLabel(row3, text="ADB Serial (optional)", text_color="#E5E7EB",
+        # Device selector (replaces manual serial entry)
+        ctk.CTkLabel(row3, text="Target device", text_color="#E5E7EB",
                     font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=2, sticky="w")
+
+        self.dyn_device_var = ctk.StringVar(value="(loading devices...)")
+        self._device_label_to_serial = {}
+
+        self.dyn_device_menu = ctk.CTkOptionMenu(
+            row3,
+            values=["(loading devices...)"],
+            variable=self.dyn_device_var,
+            fg_color="#0A1222",
+            button_color="#1E3A8A",
+            button_hover_color="#2563EB",
+        )
+        self.dyn_device_menu.grid(row=1, column=2, sticky="ew", pady=(6, 0))
+
+        btn_refresh = ctk.CTkButton(
+            scroll,
+            text="Refresh devices",
+            command=self._refresh_devices_dropdown,
+            fg_color="#0F172A",
+            hover_color="#1F2937",
+            height=36,
+        )
+        btn_refresh.grid(row=11, column=0, sticky="w", pady=(0, 12))
 
         self.dyn_seed_repeat_entry = ctk.CTkEntry(row3, placeholder_text="4")
         self.dyn_seed_repeat_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(6, 0))
@@ -1646,6 +1767,21 @@ class CyberShadowHub(ctk.CTk):
         if guess_adb and os.path.isdir(guess_adb):
             if guess_adb not in path:
                 path = guess_adb + os.pathsep + path
+        
+                # --- Add local Build-Tools from repo: inputs/build-tools/<ver> (zipalign/apksigner) ---
+        try:
+            root = _project_root_dir()
+            local_bt_root = os.path.join(root, "inputs", "build-tools")
+            if os.path.isdir(local_bt_root):
+                vers = [d for d in os.listdir(local_bt_root) if os.path.isdir(os.path.join(local_bt_root, d))]
+                vers.sort(reverse=True)
+                if vers:
+                    bt = os.path.join(local_bt_root, vers[0])  # e.g. 36.1.0
+                    if bt not in path:
+                        path = bt + os.pathsep + path
+        except Exception:
+            pass
+
 
         env["PATH"] = path
 
@@ -1941,7 +2077,10 @@ class CyberShadowHub(ctk.CTk):
 
         drive = (self.dyn_drive_var.get() if hasattr(self, "dyn_drive_var") else "monkey+allow").strip()
         seed_url = (self.dyn_seed_url_entry.get() if hasattr(self, "dyn_seed_url_entry") else "").strip()
-        serial = (self.dyn_serial_entry.get() if hasattr(self, "dyn_serial_entry") else "").strip()
+        picked = self.dyn_device_var.get().strip()
+        serial = (self._device_label_to_serial.get(picked) or "").strip()
+        # serial poate fi "" -> backend auto-pick
+
 
         self._parser = LogParser()
         self._stop_flag.clear()
@@ -1993,6 +2132,133 @@ class CyberShadowHub(ctk.CTk):
 
         t = threading.Thread(target=self._runner_pipeline, args=([cmd_dyn, cmd_case], env), daemon=True)
         t.start()
+    
+
+    def _http_post_json(self, url: str, payload: dict, timeout: int = 30) -> dict:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", errors="replace"))
+
+    def _poll_job_until_done(self, job_id: str, timeout_sec: int = 600, tick_sec: float = 0.6) -> dict:
+        t0 = time.time()
+        last_status = None
+        while True:
+            if time.time() - t0 > timeout_sec:
+                raise RuntimeError(f"job_timeout: {job_id}")
+
+            j = self._http_get_json(self._api_base() + f"/jobs/{job_id}", timeout=30)
+            status = (j.get("status") or "").upper()
+            detail = j.get("detail") or ""
+
+            if status != last_status:
+                self._q.put(f"[API] job {job_id} -> {status} ({detail})\n")
+                last_status = status
+
+            if status in ("DONE", "ERROR"):
+                return j
+
+            time.sleep(tick_sec)
+
+    def _run_repack_install_keep(self):
+        case_folder = self.case_entry.get().strip()
+        apk_path = self.apk_entry.get().strip()
+
+        if not case_folder:
+            messagebox.showerror("Missing input", "Case Folder este gol.")
+            return
+        if not apk_path or not os.path.exists(apk_path):
+            messagebox.showerror("Missing input", "APK File lipsește sau nu există.")
+            return
+
+        serial = ""
+        try:
+            picked = (self.dyn_device_var.get() or "").strip()
+            serial = (self._device_label_to_serial.get(picked) or "").strip()
+        except Exception:
+            serial = ""
+
+        payload = {
+            "case_dir": case_folder,
+            "apk_path": apk_path,
+            "serial": serial,
+            "keep_installed": True,
+            "force_repack": False,
+        }
+
+        def worker():
+            try:
+                self._q.put("------------------------------------------------------------\n")
+                self._q.put("[UI] Starting REPACK + INSTALL (keep installed) via API...\n")
+                self._q.put(f"[UI] Payload: {json.dumps(payload)}\n")
+
+                res = self._http_post_json(self._api_base() + "/run/repack_install", payload, timeout=60)
+                job_id = res.get("job_id")
+                if not job_id:
+                    raise RuntimeError(f"bad_api_response: {res}")
+
+                self._q.put(f"[UI] job_id: {job_id}\n")
+
+                job = self._poll_job_until_done(job_id, timeout_sec=900, tick_sec=0.6)
+                status = (job.get("status") or "").upper()
+                if status == "ERROR":
+                    raise RuntimeError(job.get("error") or job.get("detail") or "repack_install_failed")
+
+                result = job.get("result") or {}
+                self._q.put("\n[OK] REPACK+INSTALL DONE\n")
+                self._q.put(f"      result: {json.dumps(result, indent=2)}\n")
+                self._q.put("[UI] __RUN_FINISHED__\n")
+
+            except Exception as e:
+                self._q.put(f"\n[ERROR] {e}\n")
+                self._q.put("[UI] __RUN_FINISHED__\n")
+
+        self._set_status("Running…")
+        self._progress_running(True)
+        self._set_running_ui(True)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _uninstall_selected_pkg(self):
+        pkg = ""
+        try:
+            pkg = (self.dyn_pkg_entry.get() or "").strip()
+        except Exception:
+            pkg = ""
+
+        if not pkg:
+            messagebox.showerror("Uninstall", "Package Name este gol (tab Dynamic).")
+            return
+
+        serial = ""
+        try:
+            picked = (self.dyn_device_var.get() or "").strip()
+            serial = (self._device_label_to_serial.get(picked) or "").strip()
+        except Exception:
+            serial = ""
+
+        payload = {"package": pkg, "serial": serial}
+
+        def worker():
+            try:
+                self._q.put("------------------------------------------------------------\n")
+                self._q.put("[UI] Uninstall via API...\n")
+                res = self._http_post_json(self._api_base() + "/apk/uninstall", payload, timeout=60)
+                self._q.put(f"[OK] {json.dumps(res)}\n")
+                self._q.put("[UI] __RUN_FINISHED__\n")
+            except Exception as e:
+                self._q.put(f"[ERROR] {e}\n")
+                self._q.put("[UI] __RUN_FINISHED__\n")
+
+        self._set_status("Running…")
+        self._progress_running(True)
+        self._set_running_ui(True)
+        threading.Thread(target=worker, daemon=True).start()
+
 
     def _stop(self):
         self._stop_flag.set()
@@ -2339,7 +2605,6 @@ def inject_viewer_override_css(html: str) -> str:
         idx = m.end()
         return html[:idx] + override + html[idx:]
     return override + html
-
 
 def main():
     app = CyberShadowHub()
