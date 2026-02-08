@@ -18,7 +18,7 @@ dbg_real/
 dbg_fake/
 models/
 reports/
-src/string/
+string/
 # Logs / temp
 *.log
 *.tmp
