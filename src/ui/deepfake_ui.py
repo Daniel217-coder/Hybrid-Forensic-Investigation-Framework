@@ -75,6 +75,24 @@ def build_deepfake_video_tab(app: Any, parent: Any) -> None:
 # ============================================================
 # Helpers
 # ============================================================
+def _latest_model_ckpt(models_dir: Optional[str] = None) -> Optional[str]:
+    root = Path(_project_root_dir())
+    mdir = Path(models_dir) if models_dir else (root / "models")
+    if not mdir.exists():
+        return None
+
+    # priority: deepfake__*.pt then any *.pt/*.pth
+    cands = list(mdir.glob("deepfake__*.pt")) + list(mdir.glob("deepfake__*.pth"))
+    if not cands:
+        cands = list(mdir.glob("*.pt")) + list(mdir.glob("*.pth"))
+
+    if not cands:
+        return None
+
+    cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(cands[0])
+
+
 
 def _project_root_dir() -> str:
     # src/ui/deepfake_ui.py -> root is two parents up from /src/ui
@@ -583,9 +601,10 @@ class _DFUI:
         self.vid_path_var = ctk.StringVar(value="")
 
         # default checkpoint path
-        default_ckpt = str(Path(_project_root_dir()) / "models" / "deepfake_mixed.pt")
+        default_ckpt = _latest_model_ckpt() or str(Path(_project_root_dir()) / "models" / "deepfake_mixed.pt")
         self.img_model_var = ctk.StringVar(value=default_ckpt)
         self.vid_model_var = ctk.StringVar(value=default_ckpt)
+
 
         self.img_device_var = ctk.StringVar(value="auto")
         self.vid_device_var = ctk.StringVar(value="auto")
@@ -650,10 +669,13 @@ class _DFUI:
         ent_model.grid(row=0, column=1, sticky="ew", padx=(8, 12))
         btn_model = ctk.CTkButton(row2, text="...", width=44, height=30, command=self._pick_model_image)
         btn_model.grid(row=0, column=2, padx=(0, 12))
+        btn_latest = ctk.CTkButton(row2, text="Use latest", width=110, height=30, command=self._use_latest_model_image)
+        btn_latest.grid(row=0, column=3, padx=(0, 12))
 
-        ctk.CTkLabel(row2, text="Device", text_color="#94A3B8").grid(row=0, column=3, sticky="e")
+
+        ctk.CTkLabel(row2, text="Device", text_color="#94A3B8").grid(row=0, column=4, sticky="e")
         opt = ctk.CTkOptionMenu(row2, values=["auto", "cpu", "cuda"], variable=self.img_device_var, height=30)
-        opt.grid(row=0, column=4, sticky="w")
+        opt.grid(row=0, column=5, sticky="w")
 
         row3 = ctk.CTkFrame(ctrl, fg_color="transparent")
         row3.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
@@ -726,10 +748,13 @@ class _DFUI:
         ent_model.grid(row=0, column=1, sticky="ew", padx=(8, 12))
         btn_model = ctk.CTkButton(row2, text="...", width=44, height=30, command=self._pick_model_video)
         btn_model.grid(row=0, column=2, padx=(0, 12))
+        btn_latest = ctk.CTkButton(row2, text="Use latest", width=110, height=30, command=self._use_latest_model_video)
+        btn_latest.grid(row=0, column=3, padx=(0, 12))
 
-        ctk.CTkLabel(row2, text="Device", text_color="#94A3B8").grid(row=0, column=3, sticky="e")
+
+        ctk.CTkLabel(row2, text="Device", text_color="#94A3B8").grid(row=0, column=4, sticky="e")
         opt = ctk.CTkOptionMenu(row2, values=["auto", "cpu", "cuda"], variable=self.vid_device_var, height=30)
-        opt.grid(row=0, column=4, sticky="w")
+        opt.grid(row=0, column=5, sticky="w")
 
         row3 = ctk.CTkFrame(ctrl, fg_color="transparent")
         row3.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
@@ -800,6 +825,21 @@ class _DFUI:
         )
         if p:
             self.vid_model_var.set(p)
+    
+    def _use_latest_model_image(self) -> None:
+        p = _latest_model_ckpt()
+        if not p:
+            messagebox.showwarning("No models", "No .pt/.pth found in ./models")
+            return
+        self.img_model_var.set(p)
+
+    def _use_latest_model_video(self) -> None:
+        p = _latest_model_ckpt()
+        if not p:
+            messagebox.showwarning("No models", "No .pt/.pth found in ./models")
+            return
+        self.vid_model_var.set(p)
+
 
     def _refresh_image_preview(self) -> None:
         if self.img_preview_label is None:
@@ -847,12 +887,12 @@ class _DFUI:
     def _run_image(self) -> None:
         path = (self.img_path_var.get() or "").strip()
         if not path or not os.path.exists(path):
-            messagebox.showerror("Missing input", "Selectează o imagine validă.")
+            messagebox.showerror("Missing input", "Select a valid image.")
             return
 
         model_path = (self.img_model_var.get() or "").strip()
         if not model_path or not os.path.exists(model_path):
-            messagebox.showerror("Missing model", "Selectează un checkpoint valid (.pt).")
+            messagebox.showerror("Missing model", "Select an valid checkpoint (.pt).")
             return
 
         thr = _safe_float(self.img_thr_var.get(), 0.5)
@@ -895,12 +935,12 @@ class _DFUI:
     def _run_video(self) -> None:
         path = (self.vid_path_var.get() or "").strip()
         if not path or not os.path.exists(path):
-            messagebox.showerror("Missing input", "Selectează un video valid.")
+            messagebox.showerror("Missing input", "Select an valid video.")
             return
 
         model_path = (self.vid_model_var.get() or "").strip()
         if not model_path or not os.path.exists(model_path):
-            messagebox.showerror("Missing model", "Selectează un checkpoint valid (.pt).")
+            messagebox.showerror("Missing model", "Select an valid checkpoint (.pt).")
             return
 
         thr = _safe_float(self.vid_thr_var.get(), 0.5)

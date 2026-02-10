@@ -32,6 +32,14 @@ try:
 except Exception:
     _run_dynamic_analysis = None
 
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load env from repo-root OR inputs/api_key/.env
+ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / ".env")
+load_dotenv(ROOT / "inputs" / "api_keys" / ".env")
 
 # -------------------------
 # Models (API)
@@ -171,7 +179,9 @@ def _start_job(kind: str, case_dir: str) -> str:
 # -------------------------
 
 app = FastAPI(title="CyberShadow Local API", version="0.2.0")
-
+from src.devices_api import router as devices_router
+app.include_router(devices_router)
+app.include_router(vt_router)
 
 @app.get("/")
 def root():

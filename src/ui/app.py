@@ -1028,7 +1028,7 @@ class CyberShadowHub(ctk.CTk):
 
         ctk.CTkLabel(
             scroll,
-            text="Tip: Selectează un artifact pentru Preview în Quick Summary; apoi Load Report deschide report-ul lui.",
+            text="Tip: Select an artifact for Preview in Quick Summary; then Load Report open his report.",
             text_color="#94A3B8",
             font=ctk.CTkFont(size=12)
         ).grid(row=999, column=0, sticky="w", pady=(8, 0))
@@ -1084,8 +1084,8 @@ class CyberShadowHub(ctk.CTk):
 
         ctk.CTkLabel(
             scroll,
-            text=("Flow recomandat (telefon real): APK repack cu Frida Gadget + adb forward 27042.\n"
-                  "UI rulează automat: preflight → attach → seed-url → monkey.\n"
+            text=("Recomanded Flow (real telephone): APK repack with Frida Gadget + adb forward 27042.\n"
+                  "UI runs automatic: preflight → attach → seed-url → monkey.\n"
                   "Runner: python .\\src\\frida_auto.py"),
             text_color="#94A3B8",
             justify="left"
@@ -1233,8 +1233,8 @@ class CyberShadowHub(ctk.CTk):
 
         ctk.CTkLabel(
             scroll,
-            text=("Important: dacă folosești telefon real cu Gadget, NU rula alt frida client în paralel.\n"
-                  "UI va rula frida_auto și apoi va genera case_report automat."),
+            text=("Important: if you use a real telephone with Gadget, do not run antoher frida client in paralel.\n"
+                  "UI will run frida_auto and then will generate case_report automatically."),
             text_color="#94A3B8",
             justify="left"
         ).grid(row=13, column=0, sticky="w", pady=(8, 0))
@@ -1950,11 +1950,11 @@ class CyberShadowHub(ctk.CTk):
         self._start_pipeline([cmd_yara, cmd_case], "Starting YARA scan…")
 
     def _infer_package_for_tag(self, case_folder: str, tag: str) -> Optional[str]:
-        # 1) package override
+        # 1) package override (acceptă și "auto")
         try:
             ov = (self.memlite_pkg_entry.get().strip() if hasattr(self, "memlite_pkg_entry") else "").strip()
             if ov:
-                return ov
+                return ov  # poate fi "auto" sau un package explicit
         except Exception:
             pass
 
@@ -1963,18 +1963,22 @@ class CyberShadowHub(ctk.CTk):
         cand = os.path.join(art_dir, f"apk_static__{tag}.json")
         if os.path.exists(cand):
             obj = self._read_json_safe(cand)
-            pkg = str(obj.get("package") or "")
+            pkg = str(obj.get("package") or "").strip()
             if pkg:
                 return pkg
 
         # 3) fallback: newest apk_static__*.json
         try:
             if os.path.isdir(art_dir):
-                statics = [os.path.join(art_dir, n) for n in os.listdir(art_dir) if n.startswith("apk_static__") and n.endswith(".json")]
+                statics = [
+                    os.path.join(art_dir, n)
+                    for n in os.listdir(art_dir)
+                    if n.startswith("apk_static__") and n.endswith(".json")
+                ]
                 statics.sort(key=lambda fp: os.path.getmtime(fp), reverse=True)
                 if statics:
                     obj = self._read_json_safe(statics[0])
-                    pkg = str(obj.get("package") or "")
+                    pkg = str(obj.get("package") or "").strip()
                     if pkg:
                         return pkg
         except Exception:
@@ -1982,15 +1986,23 @@ class CyberShadowHub(ctk.CTk):
 
         return None
 
+
     def _run_memlite_only(self):
         case_folder, _apk_path, tag, risk_mode = self._validate_common_inputs()
         if not case_folder or not tag or not risk_mode:
             return
 
-        pkg = self._infer_package_for_tag(case_folder, tag)
-        if not pkg:
-            messagebox.showerror("MemLite", "Nu pot determina package-ul. Rulează Static întâi sau setează Package override (MemLite).")
-            return
+        # --- NEW: default la "auto" dacă user nu a setat override ---
+        ov = ""
+        try:
+            ov = (self.memlite_pkg_entry.get().strip() if hasattr(self, "memlite_pkg_entry") else "").strip()
+        except Exception:
+            ov = ""
+
+        if ov:
+            pkg = ov
+        else:
+            pkg = "auto"  # <- fixul: MemLite standalone prinde app-ul din foreground
 
         serial = (self.memlite_serial_entry.get().strip() if hasattr(self, "memlite_serial_entry") else "").strip()
 
@@ -2011,7 +2023,9 @@ class CyberShadowHub(ctk.CTk):
             "--case", case_folder,
             "--risk-mode", risk_mode
         ]
+
         self._start_pipeline([cmd_mem, cmd_case], f"Starting MemLite (pkg={pkg})…")
+
 
     def _compute_final_risk(self):
         case_folder, _apk_path, tag, risk_mode = self._validate_common_inputs()
@@ -2161,7 +2175,7 @@ class CyberShadowHub(ctk.CTk):
                 return json.loads(r.read().decode("utf-8", errors="replace"))
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
-            # FastAPI de obicei răspunde cu {"detail": "..."}
+            # FastAPI usually respond with {"detail": "..."}
             try:
                 j = json.loads(body) if body else {}
             except Exception:
