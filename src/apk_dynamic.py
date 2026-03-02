@@ -40,28 +40,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# project helpers
-try:
-    from src.case_manager import add_evidence, save_artifact, _ensure_case_exists  # type: ignore
-except Exception:
-    # fallback minimal
-    def _ensure_case_exists(case_dir: str):
-        Path(case_dir).mkdir(parents=True, exist_ok=True)
-        (Path(case_dir) / "evidence").mkdir(parents=True, exist_ok=True)
-        (Path(case_dir) / "artifacts").mkdir(parents=True, exist_ok=True)
-        (Path(case_dir) / "reports").mkdir(parents=True, exist_ok=True)
+from src.case_manager import add_evidence, save_artifact, new_case
 
-    def add_evidence(case_dir: str, src_path: str, kind: str) -> dict:
-        dst = Path(case_dir) / "evidence" / Path(src_path).name
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_path, dst)
-        return {"kind": kind, "path": str(dst)}
 
-    def save_artifact(case_dir: str, artifact_name: str, data: dict) -> str:
-        p = Path(case_dir) / "artifacts" / artifact_name
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        return str(p)
+def _ensure_case_exists(case_dir: str) -> None:
+    case_path = Path(case_dir)
+    if case_path.exists() and (case_path / "case.json").exists():
+        return
+    base = str(case_path.parent) if str(case_path.parent) not in ("", ".") else "cases"
+    cid = case_path.name
+    new_case(base, cid)
 
 # noise rules
 try:

@@ -34,8 +34,27 @@ def _load_json(p: Path) -> Dict[str, Any]:
 
 def _pick_latest(artifacts_dir: Path, prefix: str, tag: Optional[str] = None) -> Optional[Path]:
     if tag:
-        cand = artifacts_dir / f"{prefix}__{tag}.json"
-        return cand if cand.exists() else None
+        # Backward compatibility: exact tag file
+        #   <prefix>__<tag>.json
+        # New tolerant matching: timestamped files
+        #   <prefix>__<tag>__*.json
+        candidates: List[Path] = []
+
+        exact = artifacts_dir / f"{prefix}__{tag}.json"
+        if exact.exists():
+            candidates.append(exact)
+
+        candidates.extend(list(artifacts_dir.glob(f"{prefix}__{tag}__*.json")))
+        if not candidates:
+            return None
+
+        # de-dup and pick newest by mtime
+        uniq: Dict[str, Path] = {}
+        for p in candidates:
+            uniq[str(p.resolve())] = p
+        files = sorted(uniq.values(), key=lambda p: p.stat().st_mtime, reverse=True)
+        return files[0] if files else None
+
     files = sorted(artifacts_dir.glob(f"{prefix}__*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     return files[0] if files else None
 
@@ -213,7 +232,11 @@ def _benign_cap_applies(static_score: int, dyn_score: int, yara_unlock: bool, vt
     return base < 20
 
 
-def aggregate_case_risk(case_dir: str, tag: Optional[str] = None) -> Dict[str, Any]:
+def aggregate_case_risk(
+    case_dir: str,
+    tag: Optional[str] = None,
+    module_tags: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """
     Consistent aggregation with your UI + anti-FP rules:
       - Base = max(static, dynamic)
@@ -232,13 +255,22 @@ def aggregate_case_risk(case_dir: str, tag: Optional[str] = None) -> Dict[str, A
     if not artifacts_dir.exists():
         raise FileNotFoundError(f"Artifacts dir not found: {artifacts_dir}")
 
+    module_tags = module_tags or {}
+    static_tag = module_tags.get("static", tag)
+    dynamic_tag = module_tags.get("dynamic", tag)
+    yara_tag = module_tags.get("yara", tag)
+    memlite_tag = module_tags.get("memlite", tag)
+    vt_tag = module_tags.get("vt", None)
+
     paths = {
-        "static": _pick_latest(artifacts_dir, "apk_static", tag),
-        "dynamic": _pick_latest(artifacts_dir, "apk_dynamic", tag),
-        "yara": _pick_latest(artifacts_dir, "yara", tag),
-        "memlite": _pick_latest(artifacts_dir, "memlite", tag),
+        "static": _pick_latest(artifacts_dir, "apk_static", static_tag),
+        "dynamic": _pick_latest(artifacts_dir, "apk_dynamic", dynamic_tag),
+        "yara": _pick_latest(artifacts_dir, "yara", yara_tag),
+        "memlite": _pick_latest(artifacts_dir, "memlite", memlite_tag),
         "vt": _pick_latest(artifacts_dir, "vt", tag=None),  # VT independent
     }
+    if vt_tag:
+        paths["vt"] = _pick_latest(artifacts_dir, "vt", vt_tag)
 
     objs: Dict[str, Dict[str, Any]] = {}
     for k, p in paths.items():
@@ -358,6 +390,7 @@ def aggregate_case_risk(case_dir: str, tag: Optional[str] = None) -> Dict[str, A
             "vt_score": _vt_score(vt_obj) if vt_obj else 0,
             "vt_confidence": _vt_confidence(vt_obj) if vt_obj else 0.0,
             "vt_positives": vt_st.get("positives", 0),
+            "module_tags": {k: v for k, v in (module_tags or {}).items() if v},
             "paths": {k: str(v) if v else "" for k, v in paths.items()},
         },
         "score": total,

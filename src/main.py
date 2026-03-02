@@ -313,6 +313,7 @@ def main():
             case_dir = args.case
             apk_path = args.apk
             tag = args.tag if args.tag else _sanitize_stem(apk_path)
+            dyn_tag = f"{tag}_dyn"
 
             _ensure_case_exists(case_dir)
 
@@ -355,7 +356,6 @@ def main():
             if args.dynamic:
                 if not pkg:
                     raise RuntimeError("Static analysis did not return a package name; cannot run dynamic.")
-                dyn_tag = f"{tag}_dyn"
                 dyn_rc = _run_frida_auto(
                     case_dir=case_dir,
                     package=pkg,
@@ -383,7 +383,16 @@ def main():
             risk_path = None
             risk_obj = None
             if bool(getattr(args, "final_risk", False)):
-                risk_obj = aggregate_case_risk(case_dir, tag=tag)
+                risk_obj = aggregate_case_risk(
+                    case_dir,
+                    tag=tag,
+                    module_tags={
+                        "static": tag,
+                        "dynamic": dyn_tag,
+                        "yara": tag,
+                        "memlite": tag,
+                    },
+                )
                 risk_path = save_risk_artifact(case_dir, tag=tag, obj=risk_obj)
 
             ledger_path = None
@@ -396,6 +405,7 @@ def main():
 
             scoring = info.get("scoring", {}) or {}
             score = scoring.get("score", 0)
+            score_max = scoring.get("score_max", 100)
             sev = scoring.get("severity", "UNKNOWN")
 
             print("\n== PIPELINE SUMMARY ==")
@@ -403,7 +413,7 @@ def main():
             print(f"Evidence: {ev.get('name')} | SHA-256: {ev.get('sha256')}")
             print(f"APK: {info.get('app_name')} | {info.get('package')}")
             print(f"Static severity: {sev}")
-            print(f"Static score: {score} / 100")
+            print(f"Static score: {score} / {score_max}")
             if dyn_rc is not None:
                 print(f"Dynamic run return code: {dyn_rc}")
             print(f"Risk mode: {args.risk_mode}")

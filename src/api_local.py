@@ -20,7 +20,6 @@ from src.apk_static import analyze_apk, set_verbose
 from src.report_html import generate_apk_html_report
 from src.case_report import write_case_html
 from src.env_report import get_versions
-from src.vt_routes import router as vt_router
 
 # ADB-only dynamic (NO FRIDA REQUIRED)
 from src.apk_dynamic import run_dynamic as run_dynamic_adb  # <- important
@@ -33,7 +32,6 @@ except Exception:
     _run_dynamic_analysis = None
 
 import os
-from pathlib import Path
 from dotenv import load_dotenv
 
 # Load env from repo-root OR inputs/api_key/.env
@@ -345,10 +343,6 @@ def run_dynamic_frida_endpoint(req: RunDynamicFridaReq):
     threading.Thread(target=_job_run_dynamic_frida, args=(job_id, req), daemon=True).start()
     return {"job_id": job_id}
 
-from src.devices_api import router as devices_router
-app.include_router(devices_router)
-app.include_router(vt_router)
-
 
 # ==========================================================
 # EXTRA: Repack + Install workflow (Frida Gadget) + Uninstall
@@ -407,7 +401,14 @@ def _run_cmd_capture(cmd: List[str], timeout: int = 600) -> str:
             bt = os.path.join(bt_root, vers[0])
             env["PATH"] = bt + os.pathsep + env.get("PATH", "")
 
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+    p = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+        env=env,
+    )
     return p.stdout or ""
 
 def _apk_has_gadget(apk_path: str) -> bool:

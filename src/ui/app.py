@@ -396,21 +396,25 @@ class CyberShadowHub(ctk.CTk):
           - <case>/case__<case_id>.html (your generator)
           - <case>/reports/case_report.html (older/alternate)
           - <case>/case_report.html (rare)
-        We pick the newest matching HTML.
+        Prefer modern case__*.html; fallback to legacy case_report.html.
         """
         case_abs = self._case_abs()
         if not case_abs or not os.path.isdir(case_abs):
             return None
 
-        cands: List[str] = []
+        case_named: List[str] = []
+        legacy_named: List[str] = []
 
         # 1) common: in case root
         try:
             for name in os.listdir(case_abs):
                 if not name.lower().endswith(".html"):
                     continue
-                if name.lower().startswith("case__") or name.lower() == "case_report.html":
-                    cands.append(os.path.join(case_abs, name))
+                full = os.path.join(case_abs, name)
+                if name.lower().startswith("case__"):
+                    case_named.append(full)
+                elif name.lower() == "case_report.html":
+                    legacy_named.append(full)
         except Exception:
             pass
 
@@ -420,21 +424,29 @@ class CyberShadowHub(ctk.CTk):
             try:
                 p = os.path.join(rep_dir, "case_report.html")
                 if os.path.exists(p):
-                    cands.append(p)
+                    legacy_named.append(p)
                 for name in os.listdir(rep_dir):
                     if not name.lower().endswith(".html"):
                         continue
-                    if name.lower().startswith("case__") or name.lower() == "case_report.html":
-                        cands.append(os.path.join(rep_dir, name))
+                    full = os.path.join(rep_dir, name)
+                    if name.lower().startswith("case__"):
+                        case_named.append(full)
+                    elif name.lower() == "case_report.html":
+                        legacy_named.append(full)
             except Exception:
                 pass
 
-        cands = [p for p in cands if p and os.path.exists(p)]
-        if not cands:
+        case_named = [p for p in case_named if p and os.path.exists(p)]
+        legacy_named = [p for p in legacy_named if p and os.path.exists(p)]
+        if not case_named and not legacy_named:
             return None
 
-        cands.sort(key=lambda fp: os.path.getmtime(fp), reverse=True)
-        return cands[0]
+        if case_named:
+            case_named.sort(key=lambda fp: os.path.getmtime(fp), reverse=True)
+            return case_named[0]
+
+        legacy_named.sort(key=lambda fp: os.path.getmtime(fp), reverse=True)
+        return legacy_named[0]
 
     # ---------------- Report naming helpers ----------------
     @staticmethod
@@ -1632,14 +1644,14 @@ class CyberShadowHub(ctk.CTk):
 
     def _delete_selected_artifact(self):
         if self._proc is not None:
-            messagebox.showwarning("Running", "Oprește procesul înainte să ștergi artifacts.")
+            messagebox.showwarning("Running", "Stop the process before deleting artifacts.")
             return
         p = self._selected_artifact_path or self._artifact_radio_var.get().strip()
         if not p or not os.path.exists(p):
-            messagebox.showinfo("Delete", "Nu ai selectat un artifact valid.")
+            messagebox.showinfo("Delete", "You didn't select an valid artifact.")
             return
 
-        if not messagebox.askyesno("Delete Selected", f"Șterg artifact-ul?\n\n{p}"):
+        if not messagebox.askyesno("Delete Selected", f"Should I delete the artifact?\n\n{p}"):
             return
 
         try:
@@ -1663,14 +1675,14 @@ class CyberShadowHub(ctk.CTk):
 
         if not messagebox.askyesno(
             "Clean Generated",
-            "Șterg DOAR outputs generate?\n\n"
+            "Should I delete only generated outputs?\n\n"
             "- artifacts/apk_static__*.json\n"
             "- artifacts/apk_dynamic__*.json\n"
             "- artifacts/yara__*.json\n"
             "- artifacts/memlite__*.json\n"
             "- reports/*.html\n"
             "- case__*.html\n\n"
-            "NU atinge evidence/, case.json, ledger.json."
+            "Do not touch evidence/, case.json, ledger.json."
         ):
             return
 
@@ -2526,33 +2538,6 @@ class CyberShadowHub(ctk.CTk):
 
         return None
 
-        # Prefer case_report always if exists
-        cr = self._case_report_path()
-        if cr:
-            return cr
-
-        sel = self._selected_artifact_path or self._artifact_radio_var.get().strip()
-        if sel:
-            rp = self._report_for_artifact_path(sel)
-            if rp:
-                return rp
-
-        # fallback: parser suggests something
-        p = self._parser.summary.best_report_path()
-        if p and os.path.exists(p):
-            return p
-
-        # fallback: newest in reports OR case root
-        p2 = self._latest_report_any()
-        if p2 and os.path.exists(p2):
-            return p2
-
-        cr2 = self._case_report_path()
-        if cr2 and os.path.exists(cr2):
-            return cr2
-
-        return None
-
     def _load_report_into_viewer(self):
         # legacy button behavior: best available report
         p = self._find_report_for_selected_artifact()
@@ -2729,19 +2714,6 @@ class CyberShadowHub(ctk.CTk):
             self._sync_badges_after_report_load(path, loaded_html=html)
         except Exception:
             pass
-
-        path = os.path.abspath(path)
-        self._report_path = path
-        self.report_path_label.configure(text=f"Report: {path}")
-
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            html = f.read()
-
-        viewer_on = bool(getattr(self, "viewer_bright_var", None) and self.viewer_bright_var.get())
-        if viewer_on:
-            html = inject_viewer_override_css(html)
-
-        self.html_frame.load_html(html)
 
     def _reload_report(self):
         p = self._report_path or self._find_report_for_selected_artifact()

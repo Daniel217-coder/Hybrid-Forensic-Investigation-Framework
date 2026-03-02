@@ -84,6 +84,32 @@ def _score_band(score: int) -> str:
     return "SCORE_RED"
 
 
+def _score_max_from_scoring(scoring: dict, default: int = 100) -> int:
+    s = scoring or {}
+    mx = _safe_int(s.get("score_max", default), default)
+    if mx > 0:
+        return mx
+    risk_scale = str(s.get("risk_scale", "") or "").strip()
+    if risk_scale == "0-20":
+        return 20
+    return default
+
+
+def _score_text(score: int, score_max: int) -> str:
+    mx = _safe_int(score_max, 100)
+    if mx <= 0:
+        mx = 100
+    return f"{_safe_int(score, 0)}/{mx}"
+
+
+def _score_norm_100(score: int, score_max: int) -> int:
+    mx = _safe_int(score_max, 100)
+    if mx <= 0:
+        mx = 100
+    s = _safe_int(score, 0)
+    return _clamp(int(round((float(s) / float(mx)) * 100.0)), 0, 100)
+
+
 def sev_badge_class(sev: str) -> str:
     sev_u = str(sev or "").upper().strip()
     if sev_u in ("SAFE", "LOW"):
@@ -99,6 +125,7 @@ def sev_badge_class(sev: str) -> str:
 
 def _normalize_static(obj: dict, artifact_name: str, artifact_path: Path) -> dict:
     scoring = (obj.get("scoring") or {})
+    score_max = _score_max_from_scoring(scoring, default=20)
     return {
         "artifact_name": artifact_name,
         "artifact_path": str(artifact_path),
@@ -108,12 +135,14 @@ def _normalize_static(obj: dict, artifact_name: str, artifact_path: Path) -> dic
         "app_name": obj.get("app_name", obj.get("app", "")),
         "severity": scoring.get("severity", "UNKNOWN"),
         "score": _safe_int(scoring.get("score", 0), 0),
+        "score_max": score_max,
         "reasons": scoring.get("reasons", []) or [],
     }
 
 
 def _normalize_dynamic(obj: dict, artifact_name: str, artifact_path: Path) -> dict:
     scoring = (obj.get("scoring") or {})
+    score_max = _score_max_from_scoring(scoring, default=100)
     return {
         "artifact_name": artifact_name,
         "artifact_path": str(artifact_path),
@@ -124,6 +153,7 @@ def _normalize_dynamic(obj: dict, artifact_name: str, artifact_path: Path) -> di
         "device": obj.get("device", {}),
         "severity": scoring.get("severity", "UNKNOWN"),
         "score": _safe_int(scoring.get("score", 0), 0),
+        "score_max": score_max,
         "reasons": scoring.get("reasons", []) or [],
         "events": obj.get("events", {}) or {},
         "iocs": obj.get("iocs", {}) or {},
@@ -132,6 +162,7 @@ def _normalize_dynamic(obj: dict, artifact_name: str, artifact_path: Path) -> di
 
 def _normalize_yara(obj: dict, artifact_name: str, artifact_path: Path) -> dict:
     scoring = (obj.get("scoring") or {})
+    score_max = _score_max_from_scoring(scoring, default=100)
     matches = obj.get("matches", obj.get("results", obj.get("rules", [])))
     return {
         "artifact_name": artifact_name,
@@ -141,6 +172,7 @@ def _normalize_yara(obj: dict, artifact_name: str, artifact_path: Path) -> dict:
         "apk_name": obj.get("apk_name", obj.get("apk", "")),
         "severity": scoring.get("severity", "UNKNOWN"),
         "score": _safe_int(scoring.get("score", 0), 0),
+        "score_max": score_max,
         "reasons": scoring.get("reasons", []) or [],
         "matches": matches,
         "malicious_unlock": bool(scoring.get("malicious_unlock", obj.get("malicious_unlock", False))),
@@ -177,6 +209,7 @@ def _normalize_yara_matches(matches) -> list[dict]:
 
 def _normalize_memlite(obj: dict, artifact_name: str, artifact_path: Path) -> dict:
     scoring = (obj.get("scoring") or {})
+    score_max = _score_max_from_scoring(scoring, default=100)
     return {
         "artifact_name": artifact_name,
         "artifact_path": str(artifact_path),
@@ -186,6 +219,7 @@ def _normalize_memlite(obj: dict, artifact_name: str, artifact_path: Path) -> di
         "device": obj.get("device", {}),
         "severity": scoring.get("severity", "UNKNOWN"),
         "score": _safe_int(scoring.get("score", 0), 0),
+        "score_max": score_max,
         "reasons": scoring.get("reasons", []) or [],
         "extras": obj.get("extras", {}) or {},
     }
@@ -689,6 +723,10 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
     dyn_score = _safe_int((dyn_pick or {}).get("score", 0), 0) if risk_mode != "mean" else _mean_score(artifacts["dynamic"])
     yara_score = _safe_int((yara_pick or {}).get("score", 0), 0) if risk_mode != "mean" else _mean_score(artifacts["yara"])
     mem_score = _safe_int((mem_pick or {}).get("score", 0), 0) if risk_mode != "mean" else _mean_score(artifacts["memlite"])
+    static_score_max = _safe_int((static_pick or {}).get("score_max", 20), 20) if risk_mode != "mean" else 20
+    dyn_score_max = _safe_int((dyn_pick or {}).get("score_max", 100), 100) if risk_mode != "mean" else 100
+    yara_score_max = _safe_int((yara_pick or {}).get("score_max", 100), 100) if risk_mode != "mean" else 100
+    mem_score_max = _safe_int((mem_pick or {}).get("score_max", 100), 100) if risk_mode != "mean" else 100
 
     yara_unlock = bool((yara_pick or {}).get("malicious_unlock", False))
     agg = _aggregate_case_score(static_score, dyn_score, yara_score, mem_score, yara_unlock=yara_unlock, vt_pick=vt_pick)
@@ -744,10 +782,10 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
         <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px">
           <span class="badge sev {sev_badge_class(final_sev)}">{_escape(final_sev)}</span>
           <span class="badge score {final_band}">Score: <b>{final_score}</b>/100</span>
-          <span class="pill">Static: <b class="mono">{static_score}</b></span>
-          <span class="pill">Dynamic: <b class="mono">{dyn_score}</b></span>
-          <span class="pill">YARA: <b class="mono">{yara_score}</b></span>
-          <span class="pill">MemLite: <b class="mono">{mem_score}</b></span>
+          <span class="pill">Static: <b class="mono">{_score_text(static_score, static_score_max)}</b></span>
+          <span class="pill">Dynamic: <b class="mono">{_score_text(dyn_score, dyn_score_max)}</b></span>
+          <span class="pill">YARA: <b class="mono">{_score_text(yara_score, yara_score_max)}</b></span>
+          <span class="pill">MemLite: <b class="mono">{_score_text(mem_score, mem_score_max)}</b></span>
           <span class="pill">VT: <b class="mono">{vt_pos}/{vt_total if vt_total else "?"}</b></span>
         </div>
         <div class="small muted">Static/Dynamic are primary signals. YARA + MemLite are capped extras unless a high-confidence YARA unlock is present. VirusTotal is secondary (clean ⇒ capped add; detected ⇒ scaled).</div>
@@ -762,12 +800,13 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
     for s in artifacts.get("static", []) or []:
         sev = s.get("severity", "UNKNOWN")
         score = _safe_int(s.get("score", 0), 0)
-        band = _score_band(score)
+        score_max = _safe_int(s.get("score_max", 20), 20)
+        band = _score_band(_score_norm_100(score, score_max))
         static_rows += (
             "<tr>"
             f"<td><code>{_escape(s.get('artifact_name',''))}</code><div class='muted small'>{_escape(s.get('artifact_mtime_utc',''))}</div></td>"
             f"<td><span class='badge sev {sev_badge_class(sev)}'>{_escape(sev)}</span></td>"
-            f"<td><span class='badge score {band}'>Score: <b>{score}</b>/100</span></td>"
+            f"<td><span class='badge score {band}'>Score: <b>{_escape(_score_text(score, score_max))}</b></span></td>"
             f"<td class='small'>{_escape(s.get('package',''))}<div class='muted'>{_escape(s.get('app_name',''))}</div></td>"
             "</tr>"
         )
@@ -791,7 +830,8 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
     for d in artifacts.get("dynamic", []) or []:
         sev = d.get("severity", "UNKNOWN")
         score = _safe_int(d.get("score", 0), 0)
-        band = _score_band(score)
+        score_max = _safe_int(d.get("score_max", 100), 100)
+        band = _score_band(_score_norm_100(score, score_max))
         events_counts = _event_counts_any(d.get("events", {}) or {})
         hook = _safe_int(events_counts.get("HOOK", 0), 0)
         native = _safe_int(events_counts.get("NATIVE", 0), 0)
@@ -801,7 +841,7 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
             "<tr>"
             f"<td><code>{_escape(d.get('artifact_name',''))}</code><div class='muted small'>{_escape(d.get('artifact_mtime_utc',''))}</div></td>"
             f"<td><span class='badge sev {sev_badge_class(sev)}'>{_escape(sev)}</span></td>"
-            f"<td><span class='badge score {band}'>Score: <b>{score}</b>/100</span></td>"
+            f"<td><span class='badge score {band}'>Score: <b>{_escape(_score_text(score, score_max))}</b></span></td>"
             f"<td class='mono'>HOOK {hook} • NATIVE {native} • READY {ready}</td>"
             "</tr>"
         )
@@ -826,7 +866,8 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
     for y in artifacts.get("yara", []) or []:
         sev_y = y.get("severity", "UNKNOWN")
         score_y = _safe_int(y.get("score", 0), 0)
-        band_y = _score_band(score_y)
+        score_max_y = _safe_int(y.get("score_max", 100), 100)
+        band_y = _score_band(_score_norm_100(score_y, score_max_y))
 
         matches_list = _normalize_yara_matches(y.get("matches", None))
         mcount = len(matches_list)
@@ -842,7 +883,7 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
             "<tr>"
             f"<td><code>{_escape(y.get('artifact_name',''))}</code><div class='muted small'>{_escape(y.get('artifact_mtime_utc',''))}</div></td>"
             f"<td><span class='badge sev {sev_badge_class(sev_y)}'>{_escape(sev_y)}</span></td>"
-            f"<td><span class='badge score {band_y}'>Score: <b>{score_y}</b>/100</span></td>"
+            f"<td><span class='badge score {band_y}'>Score: <b>{_escape(_score_text(score_y, score_max_y))}</b></span></td>"
             f"<td class='mono'>{mcount}</td>"
             f"<td class='small'><span class='muted'>Top:</span> {_escape(top_rules)}</td>"
             "</tr>"
@@ -853,7 +894,7 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
             f"<div class='why-title'>YARA scan <span class='muted'>({_escape(y.get('apk_name',''))})</span></div>"
             f"<div class='why-meta'>"
             f"<span class='badge sev {sev_badge_class(sev_y)}'>{_escape(sev_y)}</span>"
-            f"<span class='badge score {band_y}'>Score: <b>{score_y}</b>/100</span>"
+            f"<span class='badge score {band_y}'>Score: <b>{_escape(_score_text(score_y, score_max_y))}</b></span>"
             f"<span class='pill'>Matches: <span class='mono'>{mcount}</span></span>"
             f"<span class='pill'>Artifact: <code>{_escape(y.get('artifact_name',''))}</code></span>"
             f"</div>"
@@ -883,7 +924,8 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
     for m in artifacts.get("memlite", []) or []:
         sev_m = m.get("severity", "UNKNOWN")
         score_m = _safe_int(m.get("score", 0), 0)
-        band_m = _score_band(score_m)
+        score_max_m = _safe_int(m.get("score_max", 100), 100)
+        band_m = _score_band(_score_norm_100(score_m, score_max_m))
 
         reasons = (m.get("reasons", []) or [])
         reasons_html3 = "<ul class='compact'>" + "".join(f"<li>{_escape(r)}</li>" for r in reasons) + "</ul>"
@@ -892,7 +934,7 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
             "<tr>"
             f"<td><code>{_escape(m.get('artifact_name',''))}</code><div class='muted small'>{_escape(m.get('artifact_mtime_utc',''))}</div></td>"
             f"<td><span class='badge sev {sev_badge_class(sev_m)}'>{_escape(sev_m)}</span></td>"
-            f"<td><span class='badge score {band_m}'>Score: <b>{score_m}</b>/100</span></td>"
+            f"<td><span class='badge score {band_m}'>Score: <b>{_escape(_score_text(score_m, score_max_m))}</b></span></td>"
             f"<td class='small'>{_escape(m.get('package',''))}</td>"
             "</tr>"
         )
@@ -902,7 +944,7 @@ def write_case_html(case_dir: str, risk_mode: RiskMode = "latest") -> str:
             f"<div class='why-title'>MemLite snapshot <span class='muted'>({_escape(m.get('package',''))})</span></div>"
             f"<div class='why-meta'>"
             f"<span class='badge sev {sev_badge_class(sev_m)}'>{_escape(sev_m)}</span>"
-            f"<span class='badge score {band_m}'>Score: <b>{score_m}</b>/100</span>"
+            f"<span class='badge score {band_m}'>Score: <b>{_escape(_score_text(score_m, score_max_m))}</b></span>"
             f"<span class='pill'>Artifact: <code>{_escape(m.get('artifact_name',''))}</code></span>"
             f"</div>"
             f"{reasons_html3}"

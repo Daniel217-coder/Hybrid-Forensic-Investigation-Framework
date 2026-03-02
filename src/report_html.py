@@ -125,7 +125,10 @@ class ApkArtifactView:
     tag: str
     device: str
 
-    score: int
+    score_raw: int
+    score_max: int
+    score_normalized: int
+    risk_scale: str
     severity_used: str
     engine_severity: str
     reasons: list[str]
@@ -145,33 +148,85 @@ def _detect_kind(artifact_name: str) -> str:
     return "UNKNOWN"
 
 
-def _extract_scoring(obj: dict) -> tuple[int, str, list[str], str]:
+def _extract_scoring(obj: dict) -> tuple[int, int, int, str, list[str], str, str]:
     scoring = obj.get("scoring", {}) or {}
     score = _safe_int(scoring.get("score", scoring.get("final_score", 0)), 0)
+    score_max = _safe_int(scoring.get("score_max", 100), 100)
+    if score_max <= 0:
+        score_max = 100
+    score = max(0, min(score_max, score))
+
+    score_norm = _clamp(int(round((float(score) / float(score_max)) * 100.0)), 0, 100)
     engine_sev = str(scoring.get("severity", "") or "").upper().strip()
+    risk_scale = str(scoring.get("risk_scale", "") or "").strip()
     reasons = scoring.get("reasons", []) or []
     reasons = [str(x) for x in reasons if x is not None]
-    sev_used = _final_severity_from_score(score)
-    return _clamp(score, 0, 100), sev_used, reasons, engine_sev
+    sev_used = _final_severity_from_score(score_norm)
+    return score, score_max, score_norm, sev_used, reasons, engine_sev, risk_scale
 
 
 def _extract_iocs(obj: dict) -> dict:
-    iocs = obj.get("iocs_split")
+    iocs = obj.get("iocs_scoring")
     if isinstance(iocs, dict):
-        return iocs
+        return {
+            "urls": _uniq(iocs.get("urls", []) or []),
+            "domains": _uniq(iocs.get("domains", []) or []),
+            "ips": _uniq(iocs.get("ips", []) or []),
+            "emails": _uniq(iocs.get("emails", []) or []),
+        }
+
+    scoring = obj.get("scoring", {}) or {}
+    iocs_filtered = scoring.get("iocs_filtered")
+    if isinstance(iocs_filtered, dict):
+        raw_iocs = obj.get("iocs", {}) or {}
+        return {
+            "urls": _uniq(iocs_filtered.get("nonwhite_urls", []) or []),
+            "domains": _uniq(iocs_filtered.get("nonwhite_domains", []) or []),
+            "ips": _uniq(raw_iocs.get("ips", []) or []),
+            "emails": _uniq(iocs_filtered.get("nonwhite_emails", []) or []),
+        }
+
     iocs = obj.get("iocs")
     if isinstance(iocs, dict):
-        return iocs
+        return {
+            "urls": _uniq(iocs.get("urls", []) or []),
+            "domains": _uniq(iocs.get("domains", []) or []),
+            "ips": _uniq(iocs.get("ips", []) or []),
+            "emails": _uniq(iocs.get("emails", []) or []),
+        }
+
+    iocs = obj.get("iocs_split")
+    if isinstance(iocs, dict):
+        suspicious = iocs.get("suspicious")
+        if isinstance(suspicious, dict):
+            return {
+                "urls": _uniq(suspicious.get("urls", []) or []),
+                "domains": _uniq(suspicious.get("domains", []) or []),
+                "ips": _uniq(suspicious.get("ips", []) or []),
+                "emails": _uniq(suspicious.get("emails", []) or []),
+            }
+        return {
+            "urls": _uniq(iocs.get("urls", []) or []),
+            "domains": _uniq(iocs.get("domains", []) or []),
+            "ips": _uniq(iocs.get("ips", []) or []),
+            "emails": _uniq(iocs.get("emails", []) or []),
+        }
+
     runtime = obj.get("runtime", {}) or {}
     iocs = runtime.get("iocs")
     if isinstance(iocs, dict):
-        return iocs
+        return {
+            "urls": _uniq(iocs.get("urls", []) or []),
+            "domains": _uniq(iocs.get("domains", []) or []),
+            "ips": _uniq(iocs.get("ips", []) or []),
+            "emails": _uniq(iocs.get("emails", []) or []),
+        }
     return {}
 
 
 def _normalize_artifact(artifact_path: Path) -> ApkArtifactView:
     obj = _load_json(artifact_path)
-    score, sev_used, reasons, engine_sev = _extract_scoring(obj)
+    score_raw, score_max, score_norm, sev_used, reasons, engine_sev, risk_scale = _extract_scoring(obj)
     kind = _detect_kind(artifact_path.name)
 
     iocs = _extract_iocs(obj)
@@ -190,7 +245,10 @@ def _normalize_artifact(artifact_path: Path) -> ApkArtifactView:
         version_code=str(obj.get("version_code", "") or ""),
         tag=str(obj.get("tag", "") or (obj.get("meta", {}) or {}).get("tag", "") or ""),
         device=str(obj.get("device", "") or (obj.get("runtime", {}) or {}).get("device", "") or ""),
-        score=score,
+        score_raw=score_raw,
+        score_max=score_max,
+        score_normalized=score_norm,
+        risk_scale=risk_scale,
         severity_used=sev_used,
         engine_severity=engine_sev,
         reasons=reasons[:120],
@@ -297,7 +355,8 @@ def generate_apk_html_report(case_dir: str, apk_artifact: Optional[str] = None) 
         return str(out)
 
     v = _normalize_artifact(artifact_path)
-    score_band = _score_band(v.score)
+    score_band = _score_band(v.score_normalized)
+    score_text = f"{v.score_raw}/{v.score_max}" if v.score_max != 100 else f"{v.score_raw}/100"
 
     report_name = _report_name_for_artifact(v.artifact_name)
     json_href = _artifact_json_href(v.artifact_name)
@@ -418,10 +477,20 @@ code {{
   border: 1px solid rgba(255,255,255,0.09);
   border-radius: 14px;
   padding: 12px 14px;
+  min-width: 0;
 }}
 .ioc-title {{ font-weight: 950; letter-spacing: 0.2px; margin-bottom: 6px; }}
-.ioc-list {{ margin: 6px 0 0 18px; padding: 0; }}
-.ioc-list li {{ margin: 6px 0; }}
+.ioc-list {{
+  margin: 6px 0 0 18px;
+  padding: 0 6px 0 0;
+  max-height: 360px;
+  overflow: auto;
+}}
+.ioc-list li {{
+  margin: 6px 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}}
 
 .LOW {{ background: rgba(0,255,160,0.10); color: rgba(140,255,210,0.95); }}
 .MEDIUM {{ background: rgba(255,190,0,0.12); color: rgba(255,210,110,0.95); }}
@@ -458,7 +527,8 @@ code {{
       <span class="pill"><b>Artifact:</b> <code>{_html_escape(v.artifact_name)}</code></span>
       <span class="pill"><b>Run:</b> <span class="mono">{_html_escape(v.artifact_mtime_utc)}</span></span>
       <span class="badge sev {v.severity_used}">{_html_escape(v.severity_used)}</span>
-      <span class="badge {score_band}">Score: <b>{_html_escape(v.score)}</b>/100</span>
+      <span class="badge {score_band}">Score: <b>{_html_escape(score_text)}</b></span>
+      {f"<span class='pill'><b>Normalized:</b> <span class='mono'>{_html_escape(v.score_normalized)}/100</span></span>" if v.score_max != 100 else ""}
     </div>
 
     <div class="row" style="margin-top:10px;">
@@ -469,12 +539,16 @@ code {{
       {f"<span class='pill'><b>Device:</b> {_html_escape(v.device)}</span>" if v.device else ""}
     </div>
 
+    <div class="row" style="margin-top:10px;">
+      <span class="pill"><b>Display severity (normalized):</b> <span class="mono">{_html_escape(v.severity_used)}</span></span>
+      <span class="pill"><b>Engine severity:</b> <span class="mono">{_html_escape(v.engine_severity or "UNKNOWN")}</span></span>
+      {f"<span class='pill'><b>Risk scale:</b> <span class='mono'>{_html_escape(v.risk_scale)}</span></span>" if v.risk_scale else ""}
+    </div>
+
     <div class="row" style="margin-top:12px; gap:10px;">
       <a class="btn" href="{_html_escape(report_name)}">Reload this report</a>
       <a class="btn ghost" href="{_html_escape(json_href)}">Open artifact JSON</a>
     </div>
-
-    {("<div class='small muted' style='margin-top:10px;'>Engine severity: <b>%s</b> (informational)</div>" % _html_escape(v.engine_severity)) if v.engine_severity else ""}
   </div>
 
   <div class="card">
