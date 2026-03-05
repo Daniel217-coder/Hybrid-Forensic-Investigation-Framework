@@ -4,6 +4,7 @@ import os
 import json
 import time
 import threading
+import html as html_lib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List, TYPE_CHECKING
@@ -24,6 +25,11 @@ try:
     from PIL import Image as PIL
 except Exception:
     PIL = None
+
+try:
+    from PIL import ExifTags as PILExifTags
+except Exception:
+    PILExifTags = None
 
 # --- Torch (runtime) ---
 try:
@@ -173,6 +179,510 @@ def _make_output_paths(kind: str) -> Tuple[Path, Path]:
     ts = _now_tag()
     base = f"deepfake_{kind}__{ts}"
     return out_dir / f"{base}.json", out_dir / f"{base}.html"
+
+
+EXIF_TAGS: Dict[int, str] = dict(getattr(PILExifTags, "TAGS", {}) or {})
+
+PAYLOAD_BIN_SIGNATURES: List[Tuple[bytes, str]] = [
+    (b"PK\x03\x04", "ZIP archive header"),
+    (b"\x7fELF", "ELF executable header"),
+    (b"MZ", "PE executable header"),
+    (b"\x1f\x8b\x08", "GZIP archive header"),
+]
+
+PAYLOAD_TEXT_SIGNATURES: List[Tuple[str, str]] = [
+    ("<script", "Script tag text"),
+    ("powershell", "PowerShell text"),
+    ("cmd.exe", "Windows command text"),
+    ("#!/bin/sh", "Shell script shebang"),
+]
+
+AI_METADATA_MARKERS = [
+    "stable diffusion",
+    "midjourney",
+    "automatic1111",
+    "comfyui",
+    "sdxl",
+    "generator",
+    "negative prompt",
+    "prompt",
+    "sampler",
+]
+
+SUSPICIOUS_METADATA_MARKERS = [
+    "powershell",
+    "cmd.exe",
+    "<script",
+    "<?php",
+    "base64,",
+    "wget ",
+    "curl ",
+    "http://",
+]
+
+
+def _human_size(n: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    v = float(max(0, int(n)))
+    for u in units:
+        if v < 1024.0 or u == units[-1]:
+            return f"{v:.2f} {u}" if u != "B" else f"{int(v)} {u}"
+        v /= 1024.0
+    return f"{int(n)} B"
+
+
+def _guess_magic(head: bytes) -> str:
+    h = head or b""
+    if h.startswith(b"\xff\xd8\xff"):
+        return "JPEG"
+    if h.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "PNG"
+    if h[:6] in (b"GIF87a", b"GIF89a"):
+        return "GIF"
+    if h.startswith(b"RIFF") and h[8:12] == b"WEBP":
+        return "WEBP"
+    if h.startswith(b"RIFF") and h[8:12] == b"AVI ":
+        return "AVI"
+    if len(h) >= 8 and h[4:8] == b"ftyp":
+        return "MP4"
+    if h.startswith(b"\x1A\x45\xDF\xA3"):
+        return "MKV_WEBM"
+    return "UNKNOWN"
+
+
+def _extension_matches_magic(ext: str, magic: str) -> bool:
+    ext_l = (ext or "").lower().strip()
+    expected = {
+        "JPEG": {".jpg", ".jpeg"},
+        "PNG": {".png"},
+        "GIF": {".gif"},
+        "WEBP": {".webp"},
+        "AVI": {".avi"},
+        "MP4": {".mp4", ".mov", ".m4v", ".3gp"},
+        "MKV_WEBM": {".mkv", ".webm"},
+    }
+    if magic not in expected:
+        return True
+    return ext_l in expected[magic]
+
+
+def _mp4_end_offset(path: str, file_size: int) -> int:
+    pos = 0
+    boxes = 0
+    try:
+        with open(path, "rb") as f:
+            while pos + 8 <= file_size and boxes < 100000:
+                f.seek(pos)
+                hdr = f.read(8)
+                if len(hdr) < 8:
+                    break
+                box_size = int.from_bytes(hdr[:4], "big", signed=False)
+                header_len = 8
+                if box_size == 0:
+                    return file_size
+                if box_size == 1:
+                    ext = f.read(8)
+                    if len(ext) < 8:
+                        break
+                    box_size = int.from_bytes(ext, "big", signed=False)
+                    header_len = 16
+                if box_size < header_len:
+                    break
+                nxt = pos + box_size
+                if nxt <= pos or nxt > file_size:
+                    break
+                pos = nxt
+                boxes += 1
+        return max(0, min(file_size, pos))
+    except Exception:
+        return 0
+
+
+def _detect_trailing_payload(path: str, magic: str) -> Dict[str, Any]:
+    size = int(os.path.getsize(path))
+    if size <= 0:
+        return {"trailing_bytes": 0, "end_offset": 0, "marker": "empty_file"}
+
+    marker = "unknown"
+    end_offset = size
+
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+            if magic == "WEBP" and head.startswith(b"RIFF") and len(head) >= 8:
+                declared = int.from_bytes(head[4:8], "little", signed=False) + 8
+                end_offset = min(size, max(0, declared))
+                marker = "webp_riff_size"
+            elif magic == "AVI" and head.startswith(b"RIFF") and len(head) >= 8:
+                declared = int.from_bytes(head[4:8], "little", signed=False) + 8
+                end_offset = min(size, max(0, declared))
+                marker = "avi_riff_size"
+            elif magic == "MP4":
+                parsed = _mp4_end_offset(path, size)
+                if parsed > 0:
+                    end_offset = parsed
+                    marker = "mp4_box_walk"
+    except Exception:
+        pass
+
+    if magic in {"JPEG", "PNG", "GIF"}:
+        try:
+            window = min(size, 2 * 1024 * 1024)
+            with open(path, "rb") as f:
+                f.seek(max(0, size - window))
+                tail = f.read(window)
+            if magic == "JPEG":
+                idx = tail.rfind(b"\xff\xd9")
+                if idx >= 0:
+                    end_offset = size - window + idx + 2
+                    marker = "jpeg_eoi"
+            elif magic == "PNG":
+                idx = tail.rfind(b"IEND\xaeB`\x82")
+                if idx >= 0:
+                    end_offset = size - window + idx + 8
+                    marker = "png_iend"
+            elif magic == "GIF":
+                idx = tail.rfind(b"\x3b")
+                if idx >= 0:
+                    end_offset = size - window + idx + 1
+                    marker = "gif_trailer"
+        except Exception:
+            pass
+
+    end_offset = max(0, min(size, int(end_offset)))
+    trailing = max(0, int(size - end_offset))
+    return {"trailing_bytes": trailing, "end_offset": end_offset, "marker": marker}
+
+
+def _scan_tail_signatures(path: str, tail_limit: int = 1024 * 1024) -> List[Dict[str, Any]]:
+    size = int(os.path.getsize(path))
+    if size <= 0:
+        return []
+
+    with open(path, "rb") as f:
+        read_n = min(size, int(tail_limit))
+        f.seek(max(0, size - read_n))
+        blob = f.read(read_n)
+
+    hits: List[Dict[str, Any]] = []
+    base_off = size - len(blob)
+
+    for sig, label in PAYLOAD_BIN_SIGNATURES:
+        idx = blob.find(sig)
+        if idx >= 0:
+            hits.append(
+                {
+                    "label": label,
+                    "kind": "binary",
+                    "signature": sig.hex(),
+                    "offset": int(base_off + idx),
+                }
+            )
+
+    blob_text = blob.decode("latin-1", errors="ignore").lower()
+    for text_sig, label in PAYLOAD_TEXT_SIGNATURES:
+        idx = blob_text.find(text_sig)
+        if idx >= 0:
+            hits.append(
+                {
+                    "label": label,
+                    "kind": "text",
+                    "signature": text_sig,
+                    "offset": int(base_off + idx),
+                }
+            )
+
+    return hits[:12]
+
+
+def _collect_image_metadata(path: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if PIL is None:
+        out["error"] = "Pillow not available"
+        return out
+
+    try:
+        with PIL.open(path) as img:
+            out["format"] = str(getattr(img, "format", "") or "")
+            out["mode"] = str(getattr(img, "mode", "") or "")
+            out["width"] = int(getattr(img, "width", 0) or 0)
+            out["height"] = int(getattr(img, "height", 0) or 0)
+
+            info = dict(getattr(img, "info", {}) or {})
+            out["info_keys"] = sorted(str(k) for k in info.keys())[:40]
+            info_preview: Dict[str, str] = {}
+            for k, v in list(info.items())[:25]:
+                sv = str(v)
+                if len(sv) > 220:
+                    sv = sv[:220] + "..."
+                info_preview[str(k)] = sv
+            out["info_preview"] = info_preview
+
+            exif_preview: Dict[str, str] = {}
+            exif_count = 0
+            if hasattr(img, "getexif"):
+                exif = img.getexif() or {}
+                exif_count = len(exif)
+                for tag_id, value in list(exif.items())[:25]:
+                    tag = EXIF_TAGS.get(int(tag_id), str(tag_id))
+                    sval = str(value)
+                    if len(sval) > 220:
+                        sval = sval[:220] + "..."
+                    exif_preview[str(tag)] = sval
+            out["exif_count"] = int(exif_count)
+            out["exif_preview"] = exif_preview
+    except Exception as e:
+        out["error"] = str(e)
+
+    return out
+
+
+def _collect_video_metadata(path: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if cv2 is None:
+        out["error"] = "OpenCV not available"
+        return out
+
+    try:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            out["error"] = "Cannot open video"
+            return out
+        try:
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            fourcc = int(cap.get(cv2.CAP_PROP_FOURCC) or 0)
+            codec = "".join(chr((fourcc >> (8 * i)) & 0xFF) for i in range(4)).strip("\x00")
+            duration = float(frame_count / fps) if fps > 0 else 0.0
+            out.update(
+                {
+                    "width": width,
+                    "height": height,
+                    "fps": round(fps, 4),
+                    "frame_count": frame_count,
+                    "duration_sec": round(duration, 3),
+                    "codec_fourcc": codec,
+                }
+            )
+        finally:
+            cap.release()
+    except Exception as e:
+        out["error"] = str(e)
+
+    return out
+
+
+def _decide_payload_verdict(score: int) -> Tuple[str, str, str]:
+    s = max(0, min(100, int(score)))
+    if s >= 60:
+        return "PAYLOAD_SUSPECTED", "60-100", "MALWARE_SUSPECTED"
+    if s >= 25:
+        return "SUSPICIOUS", "25-59", "MALWARE_SUSPECTED"
+    return "CLEAN", "0-24", "BENIGN"
+
+
+def _scan_media_payload(path: str, kind: str) -> Dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        raise RuntimeError(f"File not found: {path}")
+
+    size = int(p.stat().st_size)
+    with p.open("rb") as f:
+        head = f.read(64)
+
+    magic = _guess_magic(head)
+    ext = p.suffix.lower()
+    trailing = _detect_trailing_payload(path, magic=magic)
+    tail_hits = _scan_tail_signatures(path)
+
+    metadata = _collect_image_metadata(path) if kind == "image" else _collect_video_metadata(path)
+    metadata_blob = json.dumps(metadata, ensure_ascii=False).lower()
+    ai_metadata_hits = sorted({m for m in AI_METADATA_MARKERS if m in metadata_blob})
+    suspicious_meta_hits = sorted({m for m in SUSPICIOUS_METADATA_MARKERS if m in metadata_blob})
+
+    score = 0
+    reasons: List[str] = []
+    indicators: List[Dict[str, Any]] = []
+
+    if not _extension_matches_magic(ext, magic):
+        score += 12
+        reasons.append(f"Extension/type mismatch: ext={ext or '(none)'} vs magic={magic} (+12)")
+
+    trailing_bytes = int(trailing.get("trailing_bytes", 0) or 0)
+    if trailing_bytes > 0:
+        add = min(40, 10 + int(trailing_bytes / 2048))
+        score += add
+        reasons.append(
+            f"Trailing bytes after media end marker: {trailing_bytes} bytes ({trailing.get('marker')}) (+{add})"
+        )
+        indicators.append(
+            {
+                "type": "trailing_data",
+                "bytes": trailing_bytes,
+                "marker": trailing.get("marker"),
+                "end_offset": int(trailing.get("end_offset", 0) or 0),
+            }
+        )
+
+    for hit in tail_hits:
+        add = 20 if hit.get("kind") == "binary" else 12
+        score += add
+        reasons.append(f"Embedded payload signature in tail: {hit.get('label')} (+{add})")
+        indicators.append({"type": "signature", **hit})
+
+    if suspicious_meta_hits:
+        add = min(30, 12 + 6 * len(suspicious_meta_hits))
+        score += add
+        reasons.append(
+            f"Suspicious metadata/script markers: {', '.join(suspicious_meta_hits[:6])} (+{add})"
+        )
+        indicators.append(
+            {
+                "type": "metadata_markers",
+                "markers": suspicious_meta_hits[:20],
+            }
+        )
+
+    if ai_metadata_hits:
+        reasons.append(
+            f"AI-generation metadata markers present (informational): {', '.join(ai_metadata_hits[:6])}"
+        )
+
+    if not reasons:
+        reasons = ["No suspicious embedded payload or metadata abuse indicators detected."]
+
+    score = max(0, min(100, int(score)))
+    verdict, interval, decision = _decide_payload_verdict(score)
+
+    payload = {
+        "engine": "media_payload_forensics",
+        "input": {"path": str(p), "type": kind},
+        "result": {
+            "status": "ok",
+            "verdict": verdict,
+            "score": score,
+            "score_max": 100,
+            "classification_interval": interval,
+            "malware_decision": decision,
+            "file_meta": {
+                "name": p.name,
+                "extension": ext,
+                "size_bytes": size,
+                "size_human": _human_size(size),
+                "magic": magic,
+                "extension_matches_magic": bool(_extension_matches_magic(ext, magic)),
+            },
+            "metadata": metadata,
+            "ai_metadata_markers": ai_metadata_hits,
+            "payload_indicators": indicators[:40],
+            "reasons": reasons[:25],
+        },
+    }
+    return payload
+
+
+def _render_payload_summary(payload: Dict[str, Any]) -> str:
+    r = payload.get("result", {}) or {}
+    inp = payload.get("input", {}) or {}
+    path = str(inp.get("path", "") or "")
+    kind = str(inp.get("type", "?") or "?").upper()
+
+    lines: List[str] = []
+    lines.append(f"Media metadata/payload scan ({kind}): {r.get('verdict', '?')}")
+    lines.append(f"Input: {path}")
+    lines.append(
+        f"Score={int(r.get('score', 0) or 0)}/100 | Interval={r.get('classification_interval', '?')} | Decision={r.get('malware_decision', '?')}"
+    )
+
+    ai_hits = r.get("ai_metadata_markers") or []
+    if ai_hits:
+        lines.append(f"AI metadata markers: {', '.join([str(x) for x in ai_hits[:8]])}")
+
+    indicators = r.get("payload_indicators") or []
+    if indicators:
+        lines.append("\nPayload indicators:")
+        for it in indicators[:8]:
+            lines.append(f"  - {it.get('type')}: {it.get('label') or it.get('marker') or it.get('signature')}")
+
+    reasons = r.get("reasons") or []
+    if reasons:
+        lines.append("\nWhy this result:")
+        for rr in reasons[:8]:
+            lines.append(f"- {rr}")
+
+    return "\n".join(lines) + "\n"
+
+
+def _render_payload_html(payload: Dict[str, Any]) -> str:
+    def _h(x: Any) -> str:
+        return html_lib.escape(str(x), quote=True)
+
+    r = payload.get("result", {}) or {}
+    inp = payload.get("input", {}) or {}
+    fm = r.get("file_meta", {}) or {}
+    meta = r.get("metadata", {}) or {}
+    indicators = r.get("payload_indicators", []) or []
+    reasons = r.get("reasons", []) or []
+    ai_hits = r.get("ai_metadata_markers", []) or []
+
+    rows = [
+        ("Type", inp.get("type", "?")),
+        ("Input", inp.get("path", "")),
+        ("Verdict", r.get("verdict", "?")),
+        ("Score", f"{int(r.get('score', 0) or 0)}/100"),
+        ("Interval", r.get("classification_interval", "?")),
+        ("Decision", r.get("malware_decision", "?")),
+        ("File size", fm.get("size_human", "?")),
+        ("Magic", fm.get("magic", "UNKNOWN")),
+        ("Extension", fm.get("extension", "")),
+        ("Ext/Magic match", fm.get("extension_matches_magic", True)),
+    ]
+
+    rows_html = "".join(
+        f"<tr><td>{_h(k)}</td><td><code>{_h(v)}</code></td></tr>" for k, v in rows
+    )
+
+    meta_block = _h(json.dumps(meta, indent=2, ensure_ascii=False))
+    ind_block = _h(json.dumps(indicators, indent=2, ensure_ascii=False))
+    reasons_html = "".join(f"<li>{_h(x)}</li>" for x in reasons)
+    ai_html = ", ".join(_h(x) for x in ai_hits) if ai_hits else "(none)"
+
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CYBERSHADOW Payload/Metadata Report</title>
+<style>
+body {{ font-family: Arial, sans-serif; background:#0b1220; color:#e5e7eb; padding:20px; }}
+.card {{ background:#0f172a; border:1px solid #1f2a44; border-radius:16px; padding:18px; margin-bottom:12px; }}
+table {{ width:100%; border-collapse:collapse; margin-top:8px; }}
+td {{ padding:8px; border-bottom:1px solid #1f2a44; vertical-align:top; }}
+code, pre {{ color:#93c5fd; white-space:pre-wrap; word-break:break-word; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>Media Metadata/Payload Scan</h2>
+  <table>{rows_html}</table>
+  <p><b>AI metadata markers:</b> {ai_html}</p>
+</div>
+<div class="card">
+  <h3>Reasons</h3>
+  <ul>{reasons_html or "<li>(none)</li>"}</ul>
+</div>
+<div class="card">
+  <h3>Payload indicators</h3>
+  <pre>{ind_block}</pre>
+</div>
+<div class="card">
+  <h3>Metadata snapshot</h3>
+  <pre>{meta_block}</pre>
+</div>
+</body>
+</html>
+"""
 
 
 def _verdict(prob_fake: float, thr: float, eps: float = 0.05) -> str:
@@ -625,6 +1135,8 @@ class _DFUI:
 
         self.img_btn_analyze = None
         self.vid_btn_analyze = None
+        self.img_btn_payload_scan = None
+        self.vid_btn_payload_scan = None
 
     # -------------------- BUILDERS --------------------
 
@@ -693,9 +1205,17 @@ class _DFUI:
         row4 = ctk.CTkFrame(ctrl, fg_color="transparent")
         row4.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
         row4.grid_columnconfigure(0, weight=1)
+        row4.grid_columnconfigure(1, weight=1)
 
         self.img_btn_analyze = ctk.CTkButton(row4, text="Analyze Image", height=36, command=self._run_image)
-        self.img_btn_analyze.grid(row=0, column=0, sticky="ew")
+        self.img_btn_analyze.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.img_btn_payload_scan = ctk.CTkButton(
+            row4,
+            text="Scan Metadata/Payload",
+            height=36,
+            command=self._scan_image_payload,
+        )
+        self.img_btn_payload_scan.grid(row=0, column=1, sticky="ew")
 
         prev = ctk.CTkFrame(wrap, fg_color="#0B1220", corner_radius=14)
         prev.pack(fill="both", expand=False, pady=(0, 10))
@@ -776,9 +1296,17 @@ class _DFUI:
         row4 = ctk.CTkFrame(ctrl, fg_color="transparent")
         row4.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
         row4.grid_columnconfigure(0, weight=1)
+        row4.grid_columnconfigure(1, weight=1)
 
         self.vid_btn_analyze = ctk.CTkButton(row4, text="Analyze Video", height=36, command=self._run_video)
-        self.vid_btn_analyze.grid(row=0, column=0, sticky="ew")
+        self.vid_btn_analyze.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.vid_btn_payload_scan = ctk.CTkButton(
+            row4,
+            text="Scan Metadata/Payload",
+            height=36,
+            command=self._scan_video_payload,
+        )
+        self.vid_btn_payload_scan.grid(row=0, column=1, sticky="ew")
 
         prev = ctk.CTkFrame(wrap, fg_color="#0B1220", corner_radius=14)
         prev.pack(fill="both", expand=False, pady=(0, 10))
@@ -881,6 +1409,80 @@ class _DFUI:
         except Exception as e:
             self.vid_preview_label.configure(text=f"(preview error: {e})", image=None)
             self._vid_preview_ctk = None
+
+    def _scan_image_payload(self) -> None:
+        path = (self.img_path_var.get() or "").strip()
+        if not path or not os.path.exists(path):
+            messagebox.showerror("Missing input", "Select a valid image.")
+            return
+
+        def job():
+            try:
+                self.app._set_status("Deepfake image metadata/payload: running")
+                self.app._progress_running(True)
+                self.app._append_log(f"\n[DF][IMAGE][PAYLOAD] input={path}\n")
+
+                payload = _scan_media_payload(path, kind="image")
+                out_json, out_html = _make_output_paths("image_payload")
+                out_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+                out_html.write_text(_render_payload_html(payload), encoding="utf-8")
+
+                summary = _render_payload_summary(payload)
+                self.app._append_log(f"[DF][PAYLOAD] wrote: {str(out_json)}\n")
+                self.app._append_log(f"[DF][PAYLOAD] report: {str(out_html)}\n")
+                self.app._set_summary_text(summary)
+                self.app._set_report(str(out_html))
+
+                score = int((payload.get("result", {}) or {}).get("score", 0) or 0)
+                self.app._set_badges(max(0, min(100, score)), None)
+                self.app._scroll_end()
+
+            except Exception as e:
+                msg = str(e)
+                self.app._append_log(f"[DF][PAYLOAD][ERR] {msg}\n")
+                self.app._set_summary_text(f"Deepfake IMAGE metadata/payload scan error:\n{msg}\n")
+            finally:
+                self.app._progress_running(False)
+                self.app._set_status("Idle")
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def _scan_video_payload(self) -> None:
+        path = (self.vid_path_var.get() or "").strip()
+        if not path or not os.path.exists(path):
+            messagebox.showerror("Missing input", "Select a valid video.")
+            return
+
+        def job():
+            try:
+                self.app._set_status("Deepfake video metadata/payload: running")
+                self.app._progress_running(True)
+                self.app._append_log(f"\n[DF][VIDEO][PAYLOAD] input={path}\n")
+
+                payload = _scan_media_payload(path, kind="video")
+                out_json, out_html = _make_output_paths("video_payload")
+                out_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+                out_html.write_text(_render_payload_html(payload), encoding="utf-8")
+
+                summary = _render_payload_summary(payload)
+                self.app._append_log(f"[DF][PAYLOAD] wrote: {str(out_json)}\n")
+                self.app._append_log(f"[DF][PAYLOAD] report: {str(out_html)}\n")
+                self.app._set_summary_text(summary)
+                self.app._set_report(str(out_html))
+
+                score = int((payload.get("result", {}) or {}).get("score", 0) or 0)
+                self.app._set_badges(max(0, min(100, score)), None)
+                self.app._scroll_end()
+
+            except Exception as e:
+                msg = str(e)
+                self.app._append_log(f"[DF][PAYLOAD][ERR] {msg}\n")
+                self.app._set_summary_text(f"Deepfake VIDEO metadata/payload scan error:\n{msg}\n")
+            finally:
+                self.app._progress_running(False)
+                self.app._set_status("Idle")
+
+        threading.Thread(target=job, daemon=True).start()
 
     # -------------------- RUNNERS --------------------
 

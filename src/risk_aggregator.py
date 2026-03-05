@@ -1,6 +1,6 @@
 # src/risk_aggregator.py
 from __future__ import annotations
-
+#De modificat
 import json
 import re
 from pathlib import Path

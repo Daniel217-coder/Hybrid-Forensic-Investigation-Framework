@@ -5,8 +5,7 @@ from pathlib import Path
 
 from src.hash_utils import sha256_file
 from src.env_report import get_versions
-
-
+#De modificat si aici
 def new_case(base_dir: str, case_id: str) -> Path:
     case_path = Path(base_dir) / case_id
     (case_path / "evidence").mkdir(parents=True, exist_ok=True)

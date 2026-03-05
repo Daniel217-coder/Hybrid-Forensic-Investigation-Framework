@@ -96,68 +96,68 @@ PACKER_LIB_HINTS = {
     "bangcle": "Potential Bangcle packer hint",
 }
 
-# "High signal" dangerous permissions (static)
+# "High signal" dangerous permissions (static): each indicator has interval [0,max]
 PERM_WEIGHTS = {
-    "android.permission.BIND_ACCESSIBILITY_SERVICE": 6,
-    "android.permission.SYSTEM_ALERT_WINDOW": 5,
-    "android.permission.REQUEST_INSTALL_PACKAGES": 5,
-    "android.permission.PACKAGE_USAGE_STATS": 3,
-    "android.permission.WRITE_SETTINGS": 3,
-    "android.permission.READ_SMS": 5,
-    "android.permission.RECEIVE_SMS": 3,
-    "android.permission.SEND_SMS": 5,
-    "android.permission.RECEIVE_BOOT_COMPLETED": 2,
-    "android.permission.QUERY_ALL_PACKAGES": 2,
-    "android.permission.READ_CALL_LOG": 4,
-    "android.permission.WRITE_CALL_LOG": 4,
-    "android.permission.RECORD_AUDIO": 3,
-    "android.permission.ACCESS_FINE_LOCATION": 2,
-    "android.permission.ACCESS_COARSE_LOCATION": 1,
-    "android.permission.READ_CONTACTS": 3,
-    "android.permission.WRITE_CONTACTS": 3,
+    "android.permission.BIND_ACCESSIBILITY_SERVICE": (0, 5),
+    "android.permission.SYSTEM_ALERT_WINDOW": (0, 5),
+    "android.permission.REQUEST_INSTALL_PACKAGES": (0, 5),
+    "android.permission.PACKAGE_USAGE_STATS": (0, 3),
+    "android.permission.WRITE_SETTINGS": (0, 3),
+    "android.permission.READ_SMS": (0, 5),
+    "android.permission.RECEIVE_SMS": (0, 3),
+    "android.permission.SEND_SMS": (0, 5),
+    "android.permission.RECEIVE_BOOT_COMPLETED": (0, 2),
+    "android.permission.QUERY_ALL_PACKAGES": (0, 2),
+    "android.permission.READ_CALL_LOG": (0, 4),
+    "android.permission.WRITE_CALL_LOG": (0, 4),
+    "android.permission.RECORD_AUDIO": (0, 3),
+    "android.permission.ACCESS_FINE_LOCATION": (0, 2),
+    "android.permission.ACCESS_COARSE_LOCATION": (0, 1),
+    "android.permission.READ_CONTACTS": (0, 3),
+    "android.permission.WRITE_CONTACTS": (0, 3),
     # Common + usually benign-ish: keep very low
-    "android.permission.CAMERA": 1,
-    "android.permission.READ_EXTERNAL_STORAGE": 1,
-    "android.permission.WRITE_EXTERNAL_STORAGE": 1,
-    "android.permission.INTERNET": 0,  # don't score
+    "android.permission.CAMERA": (0, 1),
+    "android.permission.READ_EXTERNAL_STORAGE": (0, 1),
+    "android.permission.WRITE_EXTERNAL_STORAGE": (0, 1),
+    "android.permission.INTERNET": (0, 0),  # don't score
 }
 
-# Sensitive broadcast actions (ONLY if receiver exported)
+# Sensitive broadcast actions (ONLY if receiver exported): each indicator has interval [0,max]
 SUSPICIOUS_RECEIVER_ACTIONS = {
-    "android.intent.action.BOOT_COMPLETED": 4,
-    "android.intent.action.LOCKED_BOOT_COMPLETED": 4,
-    "android.provider.Telephony.SMS_RECEIVED": 6,
-    "android.provider.Telephony.WAP_PUSH_RECEIVED": 5,
-    "android.intent.action.PACKAGE_ADDED": 3,
-    "android.intent.action.PACKAGE_REPLACED": 3,
-    "android.intent.action.USER_PRESENT": 2,
-    "android.intent.action.SCREEN_ON": 2,
-    "android.intent.action.SCREEN_OFF": 2,
-    "android.intent.action.NEW_OUTGOING_CALL": 5,
-    "android.intent.action.PHONE_STATE": 4,
+    "android.intent.action.BOOT_COMPLETED": (0, 4),
+    "android.intent.action.LOCKED_BOOT_COMPLETED": (0, 4),
+    "android.provider.Telephony.SMS_RECEIVED": (0, 5),
+    "android.provider.Telephony.WAP_PUSH_RECEIVED": (0, 5),
+    "android.intent.action.PACKAGE_ADDED": (0, 3),
+    "android.intent.action.PACKAGE_REPLACED": (0, 3),
+    "android.intent.action.USER_PRESENT": (0, 2),
+    "android.intent.action.SCREEN_ON": (0, 2),
+    "android.intent.action.SCREEN_OFF": (0, 2),
+    "android.intent.action.NEW_OUTGOING_CALL": (0, 5),
+    "android.intent.action.PHONE_STATE": (0, 4),
 }
 
-# Behavior indicators (static, high-signal first)
+# Behavior indicators (static, high-signal first): each indicator has interval [0,max]
 # NOTE: reflection by itself is low-signal in modern apps (libs/tooling).
 HIGH_SIGNAL_BEHAVIOR = {
-    "DexClassLoader": (6, "Dynamic code loading (DexClassLoader)"),
-    "PathClassLoader": (3, "Dynamic class loading (PathClassLoader)"),
-    "loadDex": (4, "Dex loading routine (loadDex)"),
-    "Runtime.exec": (6, "Command execution via Runtime.exec"),
-    "ProcessBuilder": (3, "Command execution via ProcessBuilder"),
-    "addJavascriptInterface": (4, "WebView JS bridge (addJavascriptInterface)"),
-    "X509TrustManager": (2, "Custom trust manager mention (X509TrustManager)"),
-    "HostnameVerifier": (2, "Hostname verifier mention (HostnameVerifier)"),
+    "DexClassLoader": ((0, 5), "Dynamic code loading (DexClassLoader)"),
+    "PathClassLoader": ((0, 3), "Dynamic class loading (PathClassLoader)"),
+    "loadDex": ((0, 4), "Dex loading routine (loadDex)"),
+    "Runtime.exec": ((0, 5), "Command execution via Runtime.exec"),
+    "ProcessBuilder": ((0, 3), "Command execution via ProcessBuilder"),
+    "addJavascriptInterface": ((0, 4), "WebView JS bridge (addJavascriptInterface)"),
+    "X509TrustManager": ((0, 2), "Custom trust manager mention (X509TrustManager)"),
+    "HostnameVerifier": ((0, 2), "Hostname verifier mention (HostnameVerifier)"),
 }
-
+# Low-signal behavior indicators: each indicator has interval [0,max]
 LOW_SIGNAL_BEHAVIOR = {
-    "java.lang.reflect": (1, "Reflection usage (java.lang.reflect)"),
-    "Method.invoke": (1, "Reflection invocation (Method.invoke)"),
-    "Class.forName": (1, "Reflection lookup (Class.forName)"),
-    "isDebuggerConnected": (1, "Debugger detection (isDebuggerConnected)"),
-    "android.os.Debug": (1, "Debug API usage (android.os.Debug)"),
-    "Build.FINGERPRINT": (1, "Environment fingerprinting (Build.FINGERPRINT)"),
-    "ro.kernel.qemu": (1, "Emulator detection hint (ro.kernel.qemu)"),
+    "java.lang.reflect": ((0, 1), "Reflection usage (java.lang.reflect)"),
+    "Method.invoke": ((0, 1), "Reflection invocation (Method.invoke)"),
+    "Class.forName": ((0, 1), "Reflection lookup (Class.forName)"),
+    "isDebuggerConnected": ((0, 1), "Debugger detection (isDebuggerConnected)"),
+    "android.os.Debug": ((0, 1), "Debug API usage (android.os.Debug)"),
+    "Build.FINGERPRINT": ((0, 1), "Environment fingerprinting (Build.FINGERPRINT)"),
+    "ro.kernel.qemu": ((0, 1), "Emulator detection hint (ro.kernel.qemu)"),
 }
 
 # IOC regexes
@@ -169,6 +169,46 @@ DOMAIN_RE = re.compile(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", re.IGNORECASE)
 
 def _unique_sorted(items: List[str]) -> List[str]:
     return sorted(set([x for x in items if x]))
+
+
+def _interval_bounds(v: Any) -> Tuple[int, int]:
+    """
+    Accepts an interval tuple (lo, hi) or legacy scalar.
+    Returns normalized (lo, hi), with lo <= hi and lo >= 0.
+    """
+    if isinstance(v, tuple) and len(v) == 2:
+        try:
+            lo = int(v[0])
+            hi = int(v[1])
+        except Exception:
+            lo, hi = 0, 0
+    else:
+        try:
+            lo, hi = 0, int(v)
+        except Exception:
+            lo, hi = 0, 0
+
+    if lo < 0:
+        lo = 0
+    if hi < lo:
+        lo, hi = hi, lo
+    if hi < 0:
+        hi = 0
+    return lo, hi
+
+
+def _interval_score_on_hit(v: Any) -> int:
+    """
+    If the indicator is present, take the high end of its interval.
+    If absent, caller contributes 0.
+    """
+    _lo, hi = _interval_bounds(v)
+    return hi
+
+
+def _interval_text(v: Any) -> str:
+    lo, hi = _interval_bounds(v)
+    return f"{lo}-{hi}"
 
 
 def _read_android_attr(el: ET.Element, name: str) -> Optional[str]:
@@ -720,13 +760,27 @@ def _collect_strings_deep(apk_path: str, max_strings: int = 200_000) -> Dict[str
         "KeyStore", "X509Certificate",
     ]
 
-    for k, (w, desc) in HIGH_SIGNAL_BEHAVIOR.items():
+    for k, (w_range, desc) in HIGH_SIGNAL_BEHAVIOR.items():
         if k in merged_for_search:
-            high_hits.append({"indicator": k, "weight": w, "description": desc})
+            high_hits.append(
+                {
+                    "indicator": k,
+                    "weight": _interval_score_on_hit(w_range),
+                    "weight_interval": _interval_text(w_range),
+                    "description": desc,
+                }
+            )
 
-    for k, (w, desc) in LOW_SIGNAL_BEHAVIOR.items():
+    for k, (w_range, desc) in LOW_SIGNAL_BEHAVIOR.items():
         if k in merged_for_search:
-            low_hits.append({"indicator": k, "weight": w, "description": desc})
+            low_hits.append(
+                {
+                    "indicator": k,
+                    "weight": _interval_score_on_hit(w_range),
+                    "weight_interval": _interval_text(w_range),
+                    "description": desc,
+                }
+            )
 
     for kw in crypto_keywords:
         if kw in merged_for_search:
@@ -796,7 +850,15 @@ def _summarize_components(manifest_deep: Dict[str, Any]) -> Dict[str, Any]:
         acts = r.get("intent_actions") or []
         for a in acts:
             if a in SUSPICIOUS_RECEIVER_ACTIONS:
-                receiver_action_hits.append({"receiver": r.get("name"), "action": a, "weight": SUSPICIOUS_RECEIVER_ACTIONS[a]})
+                w_range = SUSPICIOUS_RECEIVER_ACTIONS[a]
+                receiver_action_hits.append(
+                    {
+                        "receiver": r.get("name"),
+                        "action": a,
+                        "weight": _interval_score_on_hit(w_range),
+                        "weight_interval": _interval_text(w_range),
+                    }
+                )
 
     # Provider risk signals: exported + no permission can be risky (data exposure), but keep modest
     provider_risk = []
@@ -880,6 +942,22 @@ def _trust_adjustment(cert: Dict[str, Any]) -> Tuple[int, List[str]]:
     return 0, reasons
 
 
+def _static_interval_decision(score: int) -> Tuple[str, str, str]:
+    """
+    Interval policy for static score 0..20:
+      - 0..6   BENIGN
+      - 7..12  SUSPICIOUS
+      - 13..20 MALWARE_LIKELY
+    Returns: (band, interval_text, malware_decision_binary)
+    """
+    s = max(0, min(SCORE_MAX, int(score)))
+    if s <= 6:
+        return "BENIGN", "0-6", "BENIGN"
+    if s <= 12:
+        return "SUSPICIOUS", "7-12", "MALWARE_SUSPECTED"
+    return "MALWARE_LIKELY", "13-20", "MALWARE_SUSPECTED"
+
+
 def score_apk_static_0_20(
     permissions: List[str],
     manifest_deep: Dict[str, Any],
@@ -910,13 +988,14 @@ def score_apk_static_0_20(
     perm_score = 0
     perm_hits: List[str] = []
     for p in sorted(perms):
-        w = PERM_WEIGHTS.get(p)
-        if w is None:
+        w_range = PERM_WEIGHTS.get(p)
+        if w_range is None:
             continue
+        w = _interval_score_on_hit(w_range)
         if w <= 0:
             continue
         perm_score += w
-        perm_hits.append(f"{p} (+{w})")
+        perm_hits.append(f"{p} [{_interval_text(w_range)}] (+{w})")
     perm_score = min(7, perm_score)
     breakdown["permissions"] = perm_score
     if perm_score:
@@ -1113,6 +1192,11 @@ def score_apk_static_0_20(
     else:
         severity = "HIGH"
 
+    class_band, class_interval, malware_decision = _static_interval_decision(score)
+    reasons.append(
+        f"Static interval decision: {class_interval} -> {class_band} ({malware_decision})"
+    )
+
     # Make reasons clean + non-duplicative
     reasons = _unique_sorted(reasons)
 
@@ -1125,6 +1209,9 @@ def score_apk_static_0_20(
         "score_max": SCORE_MAX,
         "risk_scale": "0-20",
         "severity": severity,           # SAFE/LOW/MEDIUM/HIGH
+        "classification_band": class_band,
+        "classification_interval": class_interval,
+        "malware_decision": malware_decision,
         "breakdown": breakdown,
         "top_modules": top_modules,
         "reasons": _limit_list(reasons, 12),

@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from datetime import datetime
 from typing import Literal, Any, Optional
-
+#De modificat si aici
 RiskMode = Literal["latest", "max", "mean"]
 
 

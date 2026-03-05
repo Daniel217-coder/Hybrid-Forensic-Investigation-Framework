@@ -131,6 +131,9 @@ class ApkArtifactView:
     risk_scale: str
     severity_used: str
     engine_severity: str
+    classification_band: str
+    classification_interval: str
+    malware_decision: str
     reasons: list[str]
 
     iocs_urls: list[str]
@@ -148,7 +151,7 @@ def _detect_kind(artifact_name: str) -> str:
     return "UNKNOWN"
 
 
-def _extract_scoring(obj: dict) -> tuple[int, int, int, str, list[str], str, str]:
+def _extract_scoring(obj: dict) -> tuple[int, int, int, str, list[str], str, str, str, str, str]:
     scoring = obj.get("scoring", {}) or {}
     score = _safe_int(scoring.get("score", scoring.get("final_score", 0)), 0)
     score_max = _safe_int(scoring.get("score_max", 100), 100)
@@ -161,8 +164,22 @@ def _extract_scoring(obj: dict) -> tuple[int, int, int, str, list[str], str, str
     risk_scale = str(scoring.get("risk_scale", "") or "").strip()
     reasons = scoring.get("reasons", []) or []
     reasons = [str(x) for x in reasons if x is not None]
+    class_band = str(scoring.get("classification_band", "") or "").upper().strip()
+    class_interval = str(scoring.get("classification_interval", "") or "").strip()
+    malware_decision = str(scoring.get("malware_decision", "") or "").upper().strip()
     sev_used = _final_severity_from_score(score_norm)
-    return score, score_max, score_norm, sev_used, reasons, engine_sev, risk_scale
+    return (
+        score,
+        score_max,
+        score_norm,
+        sev_used,
+        reasons,
+        engine_sev,
+        risk_scale,
+        class_band,
+        class_interval,
+        malware_decision,
+    )
 
 
 def _extract_iocs(obj: dict) -> dict:
@@ -226,7 +243,18 @@ def _extract_iocs(obj: dict) -> dict:
 
 def _normalize_artifact(artifact_path: Path) -> ApkArtifactView:
     obj = _load_json(artifact_path)
-    score_raw, score_max, score_norm, sev_used, reasons, engine_sev, risk_scale = _extract_scoring(obj)
+    (
+        score_raw,
+        score_max,
+        score_norm,
+        sev_used,
+        reasons,
+        engine_sev,
+        risk_scale,
+        class_band,
+        class_interval,
+        malware_decision,
+    ) = _extract_scoring(obj)
     kind = _detect_kind(artifact_path.name)
 
     iocs = _extract_iocs(obj)
@@ -251,6 +279,9 @@ def _normalize_artifact(artifact_path: Path) -> ApkArtifactView:
         risk_scale=risk_scale,
         severity_used=sev_used,
         engine_severity=engine_sev,
+        classification_band=class_band,
+        classification_interval=class_interval,
+        malware_decision=malware_decision,
         reasons=reasons[:120],
         iocs_urls=urls,
         iocs_domains=domains,
@@ -542,6 +573,9 @@ code {{
     <div class="row" style="margin-top:10px;">
       <span class="pill"><b>Display severity (normalized):</b> <span class="mono">{_html_escape(v.severity_used)}</span></span>
       <span class="pill"><b>Engine severity:</b> <span class="mono">{_html_escape(v.engine_severity or "UNKNOWN")}</span></span>
+      {f"<span class='pill'><b>Classification:</b> <span class='mono'>{_html_escape(v.classification_band)}</span></span>" if v.classification_band else ""}
+      {f"<span class='pill'><b>Interval:</b> <span class='mono'>{_html_escape(v.classification_interval)}</span></span>" if v.classification_interval else ""}
+      {f"<span class='pill'><b>Decision:</b> <span class='mono'>{_html_escape(v.malware_decision)}</span></span>" if v.malware_decision else ""}
       {f"<span class='pill'><b>Risk scale:</b> <span class='mono'>{_html_escape(v.risk_scale)}</span></span>" if v.risk_scale else ""}
     </div>
 

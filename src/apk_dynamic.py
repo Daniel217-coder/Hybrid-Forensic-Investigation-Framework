@@ -96,6 +96,23 @@ def _severity_from_score(score: int) -> str:
         return "MEDIUM"
     return "LOW"
 
+
+def _dynamic_interval_decision(score: int) -> Tuple[str, str, str]:
+    """
+    Interval policy for dynamic score 0..100:
+      - 0..34   BENIGN
+      - 35..59  SUSPICIOUS
+      - 60..100 MALWARE_LIKELY
+    Returns: (band, interval_text, malware_decision_binary)
+    """
+    s = _clamp(score, 0, 100)
+    if s <= 34:
+        return "BENIGN", "0-34", "BENIGN"
+    if s <= 59:
+        return "SUSPICIOUS", "35-59", "MALWARE_SUSPECTED"
+    return "MALWARE_LIKELY", "60-100", "MALWARE_SUSPECTED"
+
+
 def _run(cmd: List[str], timeout: int = 60, check: bool = False) -> Tuple[int, str]:
     try:
         cp = subprocess.run(
@@ -668,6 +685,10 @@ def _score_dynamic(
 
     score = _clamp(score, 0, 100)
     sev = _severity_from_score(score)
+    class_band, class_interval, malware_decision = _dynamic_interval_decision(score)
+    reasons.append(
+        f"Dynamic interval decision: {class_interval} -> {class_band} ({malware_decision})"
+    )
 
     if not reasons:
         reasons = ["No major dynamic risk indicators detected."]
@@ -874,6 +895,7 @@ def run_dynamic(
         net_external_connections_count=int(net_info.get("external_connections", 0) or 0),
         log_text=log_text,
     )
+    class_band, class_interval, malware_decision = _dynamic_interval_decision(score)
 
     result: Dict[str, Any] = {
         "module": "apk_dynamic",
@@ -913,7 +935,12 @@ def run_dynamic(
         "raw": {"install_out": install_out, "monkey_out": monkey_out},
         "scoring": {
             "score": int(score),
+            "score_max": 100,
+            "risk_scale": "0-100",
             "severity": severity,
+            "classification_band": class_band,
+            "classification_interval": class_interval,
+            "malware_decision": malware_decision,
             "reasons": reasons,
             "malicious_unlock": bool(malicious_unlock),
             "benign_cap_applied": bool(benign_cap_applied),
