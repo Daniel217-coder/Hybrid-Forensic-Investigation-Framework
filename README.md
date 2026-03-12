@@ -7,7 +7,7 @@ HFIF is a **case-oriented** forensic framework that organizes evidence and deriv
 * **APK static triage** (manifest/package signals + explainable reasons)
 * **Real-device dynamic analysis (non-root friendly)** using **Frida Gadget + ADB port forwarding**
 * **Per-case artifacts + HTML reports** (analyst-friendly)
-* **Integrity & traceability**: SHA-256 hashes + **tamper-evident hash-chained ledger**
+* **Integrity & traceability**: SHA-256 hashes 
 * **Risk scoring**: weights + synergy + benign-aware cap + “malicious-unlock”
 
 > **⚠️ Disclaimer:** Use only on apps/media you own or have explicit permission to analyze. Prefer a dedicated test phone.
@@ -368,3 +368,4 @@ adb -s <DEVICE_SERIAL> forward tcp:27043 tcp:27043
 
 
 ```
+
