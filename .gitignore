@@ -9,7 +9,7 @@ venv/
 # VS Code
 .vscode/
 
-# Generated/runtime data (nu urca pe GitHub)
+# Generated/runtime data 
 artifacts/
 cases/
 inputs/
