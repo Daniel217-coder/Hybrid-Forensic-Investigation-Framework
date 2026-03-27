@@ -445,8 +445,8 @@ The scoring policy under calibration is:
 ### 9.4 Dissertation evaluation datasets
 
 In the dissertation experiments, the framework was evaluated on an Android application set composed of:
-- **100 benign apps**, and
-- **100 adware/malicious apps**
+- **1100 benign apps**, and
+- **1100 adware/malicious apps**
 
 For dynamic testing, the dataset was executed under **time-bounded stimulation** on the physical device.
 
