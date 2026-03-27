@@ -35,8 +35,8 @@ rule CYBERSHADOW_DEMO_Insecure_HTTP
 rule CYBERSHADOW_DEMO_Sms_And_Internet
 {
   meta:
-    severity = "high"
-    family = "combo"
+    severity = "medium"
+    family = "suspicious"
   strings:
     $sms1 = "android.permission.READ_SMS" nocase
     $sms2 = "android.permission.RECEIVE_SMS" nocase
