@@ -806,7 +806,7 @@ pip install torch torchvision opencv-python pillow numpy
 
 ## 15. Notes for Dissertation Reproducibility
 
-For the dissertation/report version of this project, keep these details explicit:
+For the dissertation/report version of this project:
 
 1. **State clearly that dynamic analysis was executed on a physical Android device**, not only on an emulator.
 2. **Document the exact host environment**: OS, Python version, and major tools.
@@ -821,7 +821,7 @@ For the dissertation/report version of this project, keep these details explicit
 
 ## 16. References / Tools
 
-Use these references in the README or dissertation as needed:
+We used these references in the README or dissertation as needed:
 
 - Android SDK Platform-Tools (ADB)
 - Frida
@@ -852,5 +852,3 @@ For this project, the most stable path is:
 3. **Frida Gadget embedded in the target APK**
 4. **ADB forwarding to local ports 27042/27043**
 5. **Case report generation after every run**
-
-This README is intentionally written as a reproducibility document, not just a feature list.
