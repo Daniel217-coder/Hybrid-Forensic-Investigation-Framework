@@ -1,0 +1,29 @@
+# ── Web API ────────────────────────────────────────────────────────────────────
+fastapi
+uvicorn[standard]          # ASGI server: python -m uvicorn src.api_local:app
+pydantic
+python-dotenv
+
+# ── APK Static Analysis ────────────────────────────────────────────────────────
+androguard
+
+# ── Dynamic Instrumentation (optional — gracefully skipped if absent) ──────────
+frida                      # src/frida_auto.py; wrapped in try/except
+
+# ── YARA Pattern Matching (optional — gracefully skipped if absent) ────────────
+yara-python                # tools/yara_scan_csv.py, src/memory/yara_runner.py; wrapped in try/except
+
+# ── Deep Learning / Deepfake Detection ────────────────────────────────────────
+torch
+torchvision
+Pillow                     # PIL
+opencv-python              # cv2
+numpy
+tqdm
+
+# ── GUI ────────────────────────────────────────────────────────────────────────
+customtkinter
+tkinterweb
+
+# ── CLI / Output ───────────────────────────────────────────────────────────────
+rich                       # tracked in src/env_report.py
