@@ -1032,7 +1032,7 @@ python -m src.ui.app
 1. Set **Case Folder** to `.\cases\CASE_001` (or any name).
 2. Click **Browse APK** and select your `.apk` file.
    > **No APK to test with?** The repo includes a sample APK for testing at:
-   > `cases\CASE_001\evidence\org.mozilla.fennec_fdroid_1490020.apk`
+   > `cases\CASE_001\evidence\com.neumorphic.calculator_2.apk`
    > (This is Firefox for Android from F-Droid — a known benign app, useful for calibration.)
 3. Set **Tag** to something like `static_run1`.
 4. Click **Run Static Only**.
