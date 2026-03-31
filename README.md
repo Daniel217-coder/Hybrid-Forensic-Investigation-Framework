@@ -271,7 +271,7 @@ Before installing, it is useful to know what you **already have** after cloning:
 
 | Item | Path | Notes |
 |------|------|-------|
-| Sample test APK | `cases/CASE_001/evidence/com.neumorphic.calculator_2.apk` | Firefox F-Droid (benign app for calibration) |
+| Sample test APK | `cases/CASE_001/evidence/com.neumorphic.calculator_2.apk` | Calculator F-Droid (benign app for calibration) |
 | YARA demo rules | `rules/yara/cybershadow_demo.yar` | Ready to use — the GUI defaults to this folder |
 | Frida JS hooks | `src/cybershadow_dyn.js` | The Frida script used during dynamic analysis |
 | Repack tool | `tools/repack_with_gadget.py` | Used by Repack+Install button |
@@ -1033,7 +1033,7 @@ python -m src.ui.app
 2. Click **Browse APK** and select your `.apk` file.
    > **No APK to test with?** The repo includes a sample APK for testing at:
    > `cases\CASE_001\evidence\com.neumorphic.calculator_2.apk`
-   > (This is Firefox for Android from F-Droid — a known benign app, useful for calibration.)
+   > (This is Calculator for Android from F-Droid — a known benign app, useful for calibration.)
 3. Set **Tag** to something like `static_run1`.
 4. Click **Run Static Only**.
 5. Watch the **Console Log** tab — when it finishes, the **Score** and **Severity** badges update at the top.
